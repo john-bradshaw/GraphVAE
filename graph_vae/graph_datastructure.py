@@ -75,8 +75,8 @@ class BaseMolecularGraphs:
         :param max_node_size: number of nodes we expect the packed data to reperesent
         """
         # Work out the indices for which the different data lies
-        num_indcs_for_adj_mat = max_node_size * (max_node_size + 1) / 2
-        num_indcs_for_edge_atr = max_node_size * (max_node_size - 1) / 2 * CHEM_DETAILS.num_bond_types
+        num_indcs_for_adj_mat = max_node_size * (max_node_size + 1) // 2
+        num_indcs_for_edge_atr = max_node_size * (max_node_size - 1) // 2 * CHEM_DETAILS.num_bond_types
         num_indcs_for_node_attribute_matrix = max_node_size * CHEM_DETAILS.num_node_types
 
         total_indcs = num_indcs_for_adj_mat + num_indcs_for_edge_atr + num_indcs_for_node_attribute_matrix
@@ -92,18 +92,23 @@ class BaseMolecularGraphs:
 
 class OneHotMolecularGraphs(BaseMolecularGraphs):
     """
-    Grpahs where we represent the type of node bonds using one hot vector
+    Graphs where we represent the type of node bonds using one hot vector
 
     The defining tensors represent one-hot encodings of fixed edges and node types, ie a fixed graph.
 
     Stores data in torch tensors.
     """
+    def get_adj_mat_and_node_features(self, min_node_feature_dim):
+        """
+        The adjacency matrices with one-hot encoding of edge type and the node associated node features.
+        """
 
-    def get_ggnn_suitable_feats(self, node_feats_size: int):
-        """
-        For making the data suitable for a GGNN.
-        """
-        raise NotImplementedError
+        node_features = self.node_atr_matrices  # [b,v,h]
+        node_feature_dim = node_features.shape[-1]
+        if node_feature_dim < min_node_feature_dim:
+            node_features = F.pad(node_features, (0, min_node_feature_dim-node_feature_dim), "constant", 0)
+        return self.edge_atr_tensors, node_features
+
 
     def to_smiles_strings(self, add_implicit_hydrogen=True) -> typing.List[str]:
         """
@@ -168,7 +173,7 @@ class OneHotMolecularGraphs(BaseMolecularGraphs):
         # ==================
         # Create empty tensors
         adj_mat = torch.zeros(batch_size, padding_size, padding_size)
-        node_attr = torch.zeros(batch_size, CHEM_DETAILS.num_node_types)
+        node_attr = torch.zeros(batch_size, padding_size, CHEM_DETAILS.num_node_types)
         edge_attr = torch.zeros(batch_size, padding_size, padding_size, CHEM_DETAILS.num_bond_types)
 
         # ==================
@@ -201,8 +206,6 @@ class OneHotMolecularGraphs(BaseMolecularGraphs):
 
 
 
-
-
 class LogitMolecularGraphs(BaseMolecularGraphs):
     """
     A distribution over Graphs.
@@ -212,9 +215,7 @@ class LogitMolecularGraphs(BaseMolecularGraphs):
 
     Stores data in Torch Tensors.
     """
-    def __init__(self, rng: np.random.RandomState, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.rng = rng
+
 
 
     def calc_distributions_mode(self):
@@ -306,6 +307,8 @@ class LogitMolecularGraphs(BaseMolecularGraphs):
         The negative log likelihood of this distribution over graphs for the instance seen in Other
 
         Eqn 2 of paper. Use weightings in eqn 3.
+        Note that that for consistency with this paper we take the "mean" loss over adjacency and other tensors rather
+        than the sum.
         """
         # ==================
         # First we'll look at the Adjacency matrix.
@@ -313,9 +316,11 @@ class LogitMolecularGraphs(BaseMolecularGraphs):
         # that eqn2 of paper considers both the top and bottom of this matrix.
         # Although the open source implementation https://github.com/snap-stanford/GraphRNN/ seems to not double count.
         # We will double count for below but could change to only count edge probability once.
-        adj_logits = self.adj_matrices_special_diag.view(-1)
-        adj_truth = other.adj_matrices_special_diag.view(-1)
-        loss1 = F.binary_cross_entropy_with_logits(adj_logits, adj_truth, reduction='mean')
+        batch_size = self.num_graphs
+        adj_logits = self.adj_matrices_special_diag.view(-1)  # [bvv]
+        adj_truth = other.adj_matrices_special_diag.view(-1)  # [bvv]
+        loss1 = F.binary_cross_entropy_with_logits(adj_logits, adj_truth, reduction='none')
+        loss1 = torch.sum(loss1.view(batch_size, -1), dim=1) / (self.num_nodes)**2
 
         # ==================
         # We now work out which of the attribute terms we are actually interested in.
@@ -323,29 +328,44 @@ class LogitMolecularGraphs(BaseMolecularGraphs):
 
         # Start with creating the masks for selecting the right parts to take loss over
         with torch.no_grad():
+            num_nodes = self.num_nodes
             match_nodes = torch.diagonal(other.adj_matrices_special_diag, dim1=1, dim2=2) == 1.  # [b, v]
+            num_nodes_active = torch.sum(match_nodes, dim=1, dtype=torch.float32)  # [b]
+            a_norm_one = torch.sum(other.adj_matrices_special_diag, dim=[1,2], dtype=torch.float32)  # b
 
             node_attr_mask = match_nodes.view(-1)  # [bv]
+            node_idx = torch.arange(batch_size).repeat_interleave(num_nodes)
+            node_idx_ = node_idx[node_attr_mask]
 
             # edge attribute trensor mask.
             edge_mask = torch.bmm(match_nodes[:,:, None], match_nodes[:, None, :])
             diag_mask = torch.eye(self.num_nodes, self.num_nodes, dtype=torch.uint8)[None, :, :].repeat(self.num_graphs, 1, 1)
             edge_mask.masked_fill_(diag_mask, 0)
-            edge_mask = edge_mask.view(-1) # [bvv]
+            edge_mask = edge_mask.view(-1)  # [bvv]
+            edge_idx = torch.arange(batch_size).repeat_interleave(num_nodes*num_nodes)
+            edge_idx_ = edge_idx[edge_mask]
 
         # Node attribute loss
         node_num_classes = self.node_atr_matrices.shape[-1]
-        node_logits = self.node_atr_matrices.view(-1, node_num_classes) # [bv, h]
+        node_logits = self.node_atr_matrices.contiguous().view(-1, node_num_classes) # [bv, h]
         node_logits = node_logits[node_attr_mask]
         true_node = other.node_atr_matrices.view(-1, node_num_classes)[node_attr_mask]
-        loss2 = F.cross_entropy(node_logits, true_node.max(dim=1), reduction='mean')
+        loss2 = F.cross_entropy(node_logits, true_node.argmax(dim=1), reduction='none')
+        loss2 = (torch.scatter_add(torch.zeros(batch_size, dtype=loss2.dtype, device=loss2.device), 0, node_idx_, loss2)
+                 / num_nodes_active)
+
 
         # And edge attribute
         edge_num_classes = self.edge_atr_tensors.shape[-1]
-        pred_edge_logits = self.edge_atr_tensors.view(-1, edge_num_classes)
+        pred_edge_logits = self.edge_atr_tensors.contiguous().view(-1, edge_num_classes)
         pred_edge_logits = pred_edge_logits[edge_mask]
         true_edge = other.edge_atr_tensors.view(-1, edge_num_classes)[edge_mask]
-        loss3 = F.cross_entropy(pred_edge_logits, true_edge.max(dim=1), reduction='mean')
+        loss3 = F.cross_entropy(pred_edge_logits, true_edge.argmax(dim=1), reduction='none')
+
+        loss3 = torch.scatter_add(torch.zeros(batch_size, dtype=loss3.dtype, device=loss3.device), 0, edge_idx_, loss3)
+        loss3 = loss3 / (a_norm_one - num_nodes_active)
+        # ^ nb note that we are dividing through by the number of edges that should be on even though we are
+        # testing for all the attributes including the edges that are off. This is to match eqn2.
 
         # ==================
         # Finally sum together!
@@ -353,77 +373,78 @@ class LogitMolecularGraphs(BaseMolecularGraphs):
         return loss
 
 
-    @torch.no_grad()
     def return_matched_version_to_other(self, other: OneHotMolecularGraphs):
         """
         Works out a permutation from this one to other and returns this one in that permutations.
         This other should be a fixed graph.
         See section 3.4 of [1]
         """
-        assert isinstance(other, OneHotMolecularGraphs)
+        with torch.no_grad():
+            assert isinstance(other, OneHotMolecularGraphs)
 
-        # ==================
-        # First we create S -- we'll do this as a five dimensional tensor (first dim is batch dimension)
-        edg = other.edge_atr_tensors
-        edg_tilde = self.edge_atr_tensors
-        adj = other.adj_matrices_special_diag
-        adj_tilde = self.adj_matrices_special_diag
+            # ==================
+            # First we create S -- we'll do this as a five dimensional tensor (first dim is batch dimension)
+            edg = other.edge_atr_tensors
+            edg_tilde = self.edge_atr_tensors
+            adj = other.adj_matrices_special_diag
+            adj_tilde = self.adj_matrices_special_diag
 
-        # Get sizes.
-        batch_size = edg.shape[0]
-        assert batch_size == edg_tilde.shape[0]
+            # Get sizes.
+            batch_size = edg.shape[0]
+            assert batch_size == edg_tilde.shape[0]
 
-        num_nodes = edg.shape[1]
-        assert num_nodes == edg_tilde.shape[1]
+            num_nodes = edg.shape[1]
+            assert num_nodes == edg_tilde.shape[1]
 
-        # masks
-        diag_mat = torch.diag(torch.ones(num_nodes, dtype=torch.uint8, device=str(edg.device)))
-        i_equal_j_mask = diag_mat[None, :, :, None, None].repeat(batch_size, 1, 1, num_nodes, num_nodes)
-        a_equal_b_mask = diag_mat[None, None, None, :, :].repeat(batch_size,  num_nodes, num_nodes, 1, 1)
+            # masks
+            diag_mat = torch.diag(torch.ones(num_nodes, dtype=torch.uint8, device=str(edg.device)))
+            i_equal_j_mask = diag_mat[None, :, :, None, None].repeat(batch_size, 1, 1, num_nodes, num_nodes)
+            a_equal_b_mask = diag_mat[None, None, None, :, :].repeat(batch_size,  num_nodes, num_nodes, 1, 1)
 
-        # First term.
-        term1 = torch.einsum("nijk,nabk,nbij,nab,naa,nbb->nijab", edg, edg_tilde, adj, adj_tilde, adj_tilde, adj_tilde)
-        # ^ n is batch dimension
-        # now zero out according to the indicator function:
-        term1[~i_equal_j_mask] = 0.
-        term1[~a_equal_b_mask] = 0.
+            # First term.
+            term1 = torch.einsum("nijk,nabk,nij,nab,naa,nbb->nijab", edg, edg_tilde, adj, adj_tilde, adj_tilde, adj_tilde)
+            # ^ n is batch dimension
+            # now zero out according to the indicator function:
+            term1[~i_equal_j_mask] = 0.
+            term1[~a_equal_b_mask] = 0.
 
-        # Second term
-        term2 = torch.einsum("nik,nak,naa->nia", other.node_atr_matrices, self.node_atr_matrices, self.adj_matrices_special_diag)
-        term2 = term2[:, :, None, :, None].reapeat(1,1,num_nodes,1,num_nodes)
-        term2[~(i_equal_j_mask*a_equal_b_mask)] = 0.
+            # Second term
+            term2 = torch.einsum("nik,nak,naa->nia", other.node_atr_matrices, self.node_atr_matrices, self.adj_matrices_special_diag)
+            term2 = term2[:, :, None, :, None].repeat(1,1,num_nodes,1,num_nodes)
+            term2[~(i_equal_j_mask*a_equal_b_mask)] = 0.
 
-        s_tensor = term1 + term2
+            s_tensor = term1 + term2
 
-        # ==================
-        # Then we run MPM for a set number of iterations
-        # init x:
-        x = torch.full((batch_size, num_nodes, num_nodes), fill_value=1./num_nodes, device=str(s_tensor.device),
-                       dtype=s_tensor.dtype)  # ^so that it starts with the row and column sums being correct
+            # ==================
+            # Then we run MPM for a set number of iterations
+            # init x:
+            x = torch.full((batch_size, num_nodes, num_nodes), fill_value=1./num_nodes, device=str(s_tensor.device),
+                           dtype=s_tensor.dtype)  # ^so that it starts with the row and column sums being correct
 
-        for iter in range(self.mpm_iterations):
-            for i in range(num_nodes):
-                for a in range(num_nodes):
-                    summed_max = torch.sum( torch.stack(
-                        [torch.max(x[:, j, :] * s_tensor[:, i, j, a, :], dim=-1) for j in range(num_nodes) if j != i]
-                    ), dim=0)
-                    x[:, i, a] = x[:, i, a] * s_tensor[:, i, i, a, a] + summed_max
+            for iter in range(self.mpm_iterations):
+                for i in range(num_nodes):
+                    for a in range(num_nodes):
+                        summed_max = torch.sum(
+                                        torch.stack([torch.max(x[:, j, :] * s_tensor[:, i, j, a, :], dim=-1)[0]
+                                                     for j in range(num_nodes) if j != i]),
+                            dim=0)
+                        x[:, i, a] = x[:, i, a] * s_tensor[:, i, i, a, a] + summed_max
 
-            x = x / torch.norm(x, dim=(1,2), keepdim=True)
+                x = x / torch.norm(x, dim=(1,2), keepdim=True)
 
 
-        # ==================
-        # We run the Hungarian algorithm on each member of the batch
-        x = x.detach().cpu().numpy()
-        cost_matrices = -x
-        permutation_matrices = []
-        for cost_matrix in cost_matrices:
-            row_ind, col_ind = optimize.linear_sum_assignment(cost_matrix)
-            permute_other_to_self_matrix = np.zeros((num_nodes, num_nodes), dtype=np.float32)
-            permute_other_to_self_matrix[row_ind, col_ind] = 1.
-            permutation_matrices.append(permute_other_to_self_matrix)
-        permutation_matrices = np.stack(permutation_matrices)
-        permutation_matrices = torch.from_numpy(permutation_matrices).to(str(self.adj_matrices_special_diag.device))
+            # ==================
+            # We run the Hungarian algorithm on each member of the batch
+            x = x.detach().cpu().numpy()
+            cost_matrices = -x
+            permutation_matrices = []
+            for cost_matrix in cost_matrices:
+                row_ind, col_ind = optimize.linear_sum_assignment(cost_matrix)
+                permute_other_to_self_matrix = np.zeros((num_nodes, num_nodes), dtype=np.float32)
+                permute_other_to_self_matrix[row_ind, col_ind] = 1.
+                permutation_matrices.append(permute_other_to_self_matrix)
+            permutation_matrices = np.stack(permutation_matrices)
+            permutation_matrices = torch.tensor(permutation_matrices).to(str(self.adj_matrices_special_diag.device))
 
         # ==================
         # Permute the matrices
@@ -435,8 +456,8 @@ class LogitMolecularGraphs(BaseMolecularGraphs):
 
         # the edge attribute one is easier to deal with if we first switch the dimensions
         temp_edge_attr = self.edge_atr_tensors.permute(0,3,1,2).view(-1, num_nodes, num_nodes)
-        new_edge_attr = torch.bmm(permutation_matrices,temp_edge_attr)
-        new_edge_attr = torch.bmm(new_edge_attr, permutation_tranpsosed)
+        new_edge_attr = torch.bmm(permutation_matrices.repeat_interleave(CHEM_DETAILS.num_bond_types, dim=0),temp_edge_attr)
+        new_edge_attr = torch.bmm(new_edge_attr, permutation_tranpsosed.repeat_interleave(CHEM_DETAILS.num_bond_types, dim=0))
         new_edge_attr = new_edge_attr.view(batch_size, CHEM_DETAILS.num_bond_types, num_nodes, num_nodes)
         new_edge_attr = new_edge_attr.permute(0,2,3,1)
 
@@ -462,18 +483,24 @@ class LogitMolecularGraphs(BaseMolecularGraphs):
 
         # Now we want to put the edge attribute and adjacency matrices into a symmetric form
         # therefore we now create a matrix that can be used for mask and the empty adjacency and edge attribute matrices
-        msk = torch.ones(batch_size, max_node_size, max_node_size, device=str(packed_tensor.device), dtype=torch.unint8)
+        msk = torch.ones(batch_size, max_node_size, max_node_size, device=str(packed_tensor.device), dtype=torch.uint8)
         adj_mat = torch.zeros(batch_size, max_node_size, max_node_size, device=str(packed_tensor.device), dtype=packed_tensor.dtype)
         edge_attribute_tensor = torch.zeros(batch_size,  CHEM_DETAILS.num_bond_types, max_node_size, max_node_size,
                                             device=str(packed_tensor.device), dtype=packed_tensor.dtype)
 
         # Now add the correct entries in.
-        adj_mat[msk.triu()] = adj_mat_logits.view(-1)
+        adj_mat[msk.triu()] = adj_mat_logits.contiguous().view(-1)
         adj_mat += adj_mat.triu(diagonal=1).transpose(1,2)  # add the lower triagonal part.
-        edge_attribute_tensor[msk[:, None, :, :].triu().repeat(1,CHEM_DETAILS.num_bond_types, 1,1)] = edge_atr_logits.view(-1)
+        edge_attribute_tensor[msk[:, None, :, :].triu(diagonal=1).repeat(1,CHEM_DETAILS.num_bond_types, 1,1)] = edge_atr_logits.contiguous().view(-1)
         edge_attribute_tensor = edge_attribute_tensor.view(-1, max_node_size, max_node_size)
         edge_attribute_tensor += edge_attribute_tensor.triu(diagonal=1).transpose(1,2)
         edge_attribute_tensor = edge_attribute_tensor.view(batch_size,  CHEM_DETAILS.num_bond_types, max_node_size, max_node_size)
         edge_attribute_tensor = edge_attribute_tensor.permute(0,2,3,1)
 
-        return cls(adj_mat, edge_attribute_tensor, node_atr_logits, logit_version_flag=True)
+        # Now reshape the node attribute
+        node_atr_logits = node_atr_logits.view(batch_size, max_node_size, CHEM_DETAILS.num_node_types)
+
+        return cls(adj_mat, edge_attribute_tensor, node_atr_logits)
+
+
+
