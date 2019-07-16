@@ -23,7 +23,5 @@ GraphRNN: Generating Realistic Graphs with Deep Auto-regressive Model (ICML 2018
 
 
 # TODOS:
-[] update GNN submodule reference  
 [] debug the vae model: especially check the graph matching part  
-[] Add tensorboard hooks to training  
 [] Write the sample script. 

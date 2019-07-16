@@ -231,7 +231,7 @@ class LogitMolecularGraphs(BaseMolecularGraphs):
         # ==================
         # Convert to probabilties (from logits)
         adj_probs = F.sigmoid(self.adj_matrices_special_diag).detach().cpu().numpy()
-        edge_atr_probs = F.softmax(self.adj_matrices_special_diag, dim=-1).detach().cpu().numpy()
+        edge_atr_probs = F.softmax(self.edge_atr_tensors, dim=-1).detach().cpu().numpy()
         node_atr_probs = F.softmax(self.node_atr_matrices, dim=-1).detach().cpu().numpy()
 
         # ==================
@@ -252,7 +252,7 @@ class LogitMolecularGraphs(BaseMolecularGraphs):
             # ===
             # Now work out what edges are on.
             # # The maximum spanning tree is introduced in Section 4.1 of [1]
-            new_adj = adj[adj_indcs, adj_indcs]
+            new_adj = adj[adj_indcs, :][:, adj_indcs]
             np.fill_diagonal(new_adj, 0.)
             mst = csgraph.minimum_spanning_tree(-new_adj).toarray()
             definitely_on_edges = mst < 0
@@ -267,17 +267,23 @@ class LogitMolecularGraphs(BaseMolecularGraphs):
             nodes_of_interest = node_atr_probs[i, adj_indcs]
             nodes_attr = np.zeros_like(nodes_of_interest)
             indcs_on = np.argmax(nodes_of_interest, axis=1)
-            nodes_attr[indcs_on] = 1.
+            nodes_attr[np.arange(indcs_on.shape[0]), indcs_on] = 1.
             all_node_atr.append(nodes_attr)
 
             # ===
             # Now work out the edge types for the on nodes.
-            edges_of_interest = edge_atr_probs[i, adj_indcs, adj_indcs, :]
-            edge_attr = np.zeros(edges_of_interest)
-            edge_attr[np.argmax(edges_of_interest, axis=-1)] = 1.
+            edges_of_interest = edge_atr_probs[i, adj_indcs, ...][:, adj_indcs, :]
+            edge_attr = np.zeros_like(edges_of_interest, dtype=NP_FLOAT_TYPE)
+            num_nodes, _, num_edges = edge_attr.shape
+            edge_attr = edge_attr.reshape(-1, num_edges)
+            edges_on = adj_matrix.flatten()==1
+            edge_attr[np.arange(num_nodes*num_nodes)[edges_on], np.argmax(edges_of_interest, axis=-1).flatten()[edges_on]] = 1.
+            edge_attr = edge_attr.reshape(num_nodes, num_nodes, num_edges)
+
 
             # We now set the bottom of the adjacency matrix to match the top (should be unecessary)
-            edge_attr[np.tril_indices(edge_attr.shape[0])[:, :, None]] = 0.
+            # --but zeros out diagonal
+            edge_attr[np.tril_indices(edge_attr.shape[0])] = 0.
             edge_attr = edge_attr + np.transpose(edge_attr, (1, 0, 2))
             all_edge_attr.append(edge_attr)
 
@@ -289,7 +295,7 @@ class LogitMolecularGraphs(BaseMolecularGraphs):
             g_size = all_adjs[i].shape[0]
             all_adjs[i] = np.pad(all_adjs[i], ((0, max_size-g_size), (0, max_size-g_size)), mode='constant',
                                  constant_values=0.)
-            all_node_atr[i] = np.pad(all_node_atr[i], (0, max_size-g_size), mode='constant',
+            all_node_atr[i] = np.pad(all_node_atr[i], ((0, max_size-g_size), (0, 0)), mode='constant',
                                  constant_values=0.)
             all_edge_attr[i] = np.pad(all_edge_attr[i], ((0, max_size-g_size), (0, max_size-g_size), (0, 0)), mode='constant',
                                  constant_values=0.)
@@ -320,7 +326,7 @@ class LogitMolecularGraphs(BaseMolecularGraphs):
         adj_logits = self.adj_matrices_special_diag.view(-1)  # [bvv]
         adj_truth = other.adj_matrices_special_diag.view(-1)  # [bvv]
         loss1 = F.binary_cross_entropy_with_logits(adj_logits, adj_truth, reduction='none')
-        loss1 = torch.sum(loss1.view(batch_size, -1), dim=1) / (self.num_nodes)**2
+        loss1 = torch.sum(loss1.view(batch_size, -1), dim=1) / ((self.num_nodes)**2)
 
         # ==================
         # We now work out which of the attribute terms we are actually interested in.
@@ -335,15 +341,15 @@ class LogitMolecularGraphs(BaseMolecularGraphs):
 
             node_attr_mask = match_nodes.view(-1)  # [bv]
             node_idx = torch.arange(batch_size).repeat_interleave(num_nodes)
-            node_idx_ = node_idx[node_attr_mask]
+            graph_idx_associated_with_considered_node = node_idx[node_attr_mask]
 
-            # edge attribute trensor mask.
+            # edge attribute tensor mask.
             edge_mask = torch.bmm(match_nodes[:,:, None], match_nodes[:, None, :])
             diag_mask = torch.eye(self.num_nodes, self.num_nodes, dtype=torch.uint8)[None, :, :].repeat(self.num_graphs, 1, 1)
             edge_mask.masked_fill_(diag_mask, 0)
             edge_mask = edge_mask.view(-1)  # [bvv]
             edge_idx = torch.arange(batch_size).repeat_interleave(num_nodes*num_nodes)
-            edge_idx_ = edge_idx[edge_mask]
+            graph_idx_associated_with_considered_edge = edge_idx[edge_mask]
 
         # Node attribute loss
         node_num_classes = self.node_atr_matrices.shape[-1]
@@ -351,7 +357,7 @@ class LogitMolecularGraphs(BaseMolecularGraphs):
         node_logits = node_logits[node_attr_mask]
         true_node = other.node_atr_matrices.view(-1, node_num_classes)[node_attr_mask]
         loss2 = F.cross_entropy(node_logits, true_node.argmax(dim=1), reduction='none')
-        loss2 = (torch.scatter_add(torch.zeros(batch_size, dtype=loss2.dtype, device=loss2.device), 0, node_idx_, loss2)
+        loss2 = (torch.scatter_add(torch.zeros(batch_size, dtype=loss2.dtype, device=loss2.device), 0, graph_idx_associated_with_considered_node, loss2)
                  / num_nodes_active)
 
 
@@ -362,7 +368,7 @@ class LogitMolecularGraphs(BaseMolecularGraphs):
         true_edge = other.edge_atr_tensors.view(-1, edge_num_classes)[edge_mask]
         loss3 = F.cross_entropy(pred_edge_logits, true_edge.argmax(dim=1), reduction='none')
 
-        loss3 = torch.scatter_add(torch.zeros(batch_size, dtype=loss3.dtype, device=loss3.device), 0, edge_idx_, loss3)
+        loss3 = torch.scatter_add(torch.zeros(batch_size, dtype=loss3.dtype, device=loss3.device), 0, graph_idx_associated_with_considered_edge, loss3)
         loss3 = loss3 / (a_norm_one - num_nodes_active)
         # ^ nb note that we are dividing through by the number of edges that should be on even though we are
         # testing for all the attributes including the edges that are off. This is to match eqn2.
@@ -377,7 +383,7 @@ class LogitMolecularGraphs(BaseMolecularGraphs):
         """
         Works out a permutation from this one to other and returns this one in that permutations.
         This other should be a fixed graph.
-        See section 3.4 of [1]
+        See section 3.4 of [1] and the appendix A.
         """
         with torch.no_grad():
             assert isinstance(other, OneHotMolecularGraphs)
@@ -385,9 +391,11 @@ class LogitMolecularGraphs(BaseMolecularGraphs):
             # ==================
             # First we create S -- we'll do this as a five dimensional tensor (first dim is batch dimension)
             edg = other.edge_atr_tensors
-            edg_tilde = self.edge_atr_tensors
+            edg_tilde = F.softmax(self.edge_atr_tensors, dim=-1)
             adj = other.adj_matrices_special_diag
-            adj_tilde = self.adj_matrices_special_diag
+            adj_tilde = F.sigmoid(self.adj_matrices_special_diag)
+            node_attr = other.node_atr_matrices
+            node_attr_tilde = F.softmax(self.node_atr_matrices, dim=-1)
 
             # Get sizes.
             batch_size = edg.shape[0]
@@ -397,21 +405,21 @@ class LogitMolecularGraphs(BaseMolecularGraphs):
             assert num_nodes == edg_tilde.shape[1]
 
             # masks
-            diag_mat = torch.diag(torch.ones(num_nodes, dtype=torch.uint8, device=str(edg.device)))
-            i_equal_j_mask = diag_mat[None, :, :, None, None].repeat(batch_size, 1, 1, num_nodes, num_nodes)
-            a_equal_b_mask = diag_mat[None, None, None, :, :].repeat(batch_size,  num_nodes, num_nodes, 1, 1)
+            diag_mat = torch.diag(torch.ones(num_nodes, dtype=torch.uint8, device=str(edg.device)))  # [v, v]
+            i_equal_j_mask = diag_mat[None, :, :, None, None].repeat(batch_size, 1, 1, num_nodes, num_nodes) # [b,v,v,v,v]
+            a_equal_b_mask = diag_mat[None, None, None, :, :].repeat(batch_size,  num_nodes, num_nodes, 1, 1) # [b,v,v,v,v]
 
             # First term.
             term1 = torch.einsum("nijk,nabk,nij,nab,naa,nbb->nijab", edg, edg_tilde, adj, adj_tilde, adj_tilde, adj_tilde)
             # ^ n is batch dimension
-            # now zero out according to the indicator function:
-            term1[~i_equal_j_mask] = 0.
-            term1[~a_equal_b_mask] = 0.
+            # now zero out according to the indicator function (De Morgan 1 to convert into or):
+            term1[i_equal_j_mask] = 0.
+            term1[a_equal_b_mask] = 0.
 
             # Second term
-            term2 = torch.einsum("nik,nak,naa->nia", other.node_atr_matrices, self.node_atr_matrices, self.adj_matrices_special_diag)
+            term2 = torch.einsum("nik,nak,naa->nia", node_attr, node_attr_tilde, adj_tilde)
             term2 = term2[:, :, None, :, None].repeat(1,1,num_nodes,1,num_nodes)
-            term2[~(i_equal_j_mask*a_equal_b_mask)] = 0.
+            term2[~(i_equal_j_mask & a_equal_b_mask)] = 0.
 
             s_tensor = term1 + term2
 

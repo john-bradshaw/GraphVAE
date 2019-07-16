@@ -59,7 +59,7 @@ class EncoderNet(nn.Module):
 
 
 class Decoder(base_parameterised_distribution.BaseParameterisedDistribution):
-    def __init__(self, max_num_nodes: int, latent_space_dim: int):
+    def __init__(self, max_num_nodes: int, latent_space_dim: int, run_graph_matching_flag: bool):
         super().__init__()
 
 
@@ -71,29 +71,33 @@ class Decoder(base_parameterised_distribution.BaseParameterisedDistribution):
                                                 )
         self.max_num_nodes = max_num_nodes
         self._tilde_structure: typing.Optional[graph_datastructure.LogitMolecularGraphs] = None
+        self.run_graph_matching_flag = run_graph_matching_flag
 
     def mode(self):
         return self._tilde_structure.calc_distributions_mode()
 
     def nlog_like_of_obs(self, obs: graph_datastructure.OneHotMolecularGraphs) -> torch.Tensor:
-        #this_graph_matched = self._tilde_structure.return_matched_version_to_other(obs)
-        this_graph_matched = self._tilde_structure
+        if self.run_graph_matching_flag:
+            this_graph_matched = self._tilde_structure.return_matched_version_to_other(obs)
+        else:
+            # this version is called NoGM in table 1 of paper.
+            this_graph_matched = self._tilde_structure
         nll = this_graph_matched.neg_log_like(obs)
         return nll
 
     def update(self, latent_z: torch.Tensor):
         graph_logits_packed = self.parameterizing_net(latent_z)
-        self._tilde_structure = graph_datastructure.LogitMolecularGraphs.create_from_nn_prediction(graph_logits_packed, self.max_num_nodes)
+        self._tilde_structure = graph_datastructure.LogitMolecularGraphs.create_from_nn_prediction(graph_logits_packed,
+                                                                                                   self.max_num_nodes)
 
 
-
-def make_gvae(latent_space_dim: int, max_num_nodes, cuda_details: utils.CudaDetails):
+def make_gvae(latent_space_dim: int, max_num_nodes, cuda_details: utils.CudaDetails, run_graph_matching_flag: bool):
     # Encoder
     encoder = nn_paramterised_dists.NNParamterisedDistribution(EncoderNet(64, cuda_details, T=3, out_dim=2 * latent_space_dim),
-                                                               shallow_distributions.IndependentGaussianDistribution())
+                                                    shallow_distributions.IndependentGaussianDistribution())
 
     # Decoder
-    decoder = Decoder(max_num_nodes, latent_space_dim)
+    decoder = Decoder(max_num_nodes, latent_space_dim, run_graph_matching_flag)
 
     # Latent Prior
     latent_prior = shallow_distributions.IndependentGaussianDistribution(torch.zeros(1, 2 * latent_space_dim))
