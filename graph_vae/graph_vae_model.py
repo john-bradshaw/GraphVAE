@@ -3,11 +3,13 @@ import typing
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from autoencoders import variational
 from autoencoders.dist_parameterisers import nn_paramterised_dists
 from autoencoders.dist_parameterisers import shallow_distributions
 from autoencoders.dist_parameterisers import base_parameterised_distribution
+from autoencoders import logging_tools
 
 from graph_neural_networks.pad_pattern import ggnn_pad
 from graph_neural_networks.ggnn_general import ggnn_base
@@ -15,8 +17,31 @@ from graph_neural_networks.ggnn_general import graph_tops
 from graph_neural_networks.core import utils
 from graph_neural_networks.core import mlp
 
-
 from . import graph_datastructure
+
+
+
+class GrapTopGGNN(nn.Module):
+
+    def __init__(self, mlp_project_up, mlp_gate, mlp_func):
+        super().__init__()
+        self.mlp_project_up = mlp_project_up  # net that goes from [None, h'] to [None, j] with j>h usually
+        self.mlp_gate = mlp_gate  # net that goes from [None, h'] to [None, 1]
+        self.mlp_func = mlp_func  # net that goes from [None, j] to [None, q]
+
+    def forward(self, node_features):
+        """
+        :param node_features: shape is [b, v, h']
+        :return: shape [b,q]
+        """
+        b, v, h = node_features.shape
+        proj_up = F.tanh(self.mlp_project_up(node_features.view(-1, h)).view(b,v,-1))  # [b,v,j]
+        gate_logit = self.mlp_gate(node_features.view(-1, h)).view(b,v,1)   # [b,v,1]
+        gate = torch.sigmoid(gate_logit)
+
+        gated_sum = F.tanh(torch.sum(proj_up * gate, dim=1))  # [b,j]
+        result = self.mlp_func(gated_sum)
+        return result
 
 
 class EncoderNet(nn.Module):
@@ -30,18 +55,10 @@ class EncoderNet(nn.Module):
             ggnn_base.GGNNParams(graph_hidden_layer_size, edge_names, cuda_details, T))
 
         # Aggregation function
-        mlp_project_up = mlp.MLP(mlp.MlpParams(graph_hidden_layer_size, graph_hidden_layer_size, []))
+        mlp_project_up = mlp.MLP(mlp.MlpParams(graph_hidden_layer_size, 128, []))
         mlp_gate = mlp.MLP(mlp.MlpParams(graph_hidden_layer_size, 1, []))
-        mlp_down = lambda x: x
-        self.ggnn_top = ggnn_pad.GraphFeatureTopOnly(mlp_project_up, mlp_gate, mlp_down)
-
-        # Mean var parametrizer
-        self.top_net = nn.Sequential(
-                                     nn.Linear(self.hidden_layer_size, 128),
-                                     nn.BatchNorm1d(128),
-                                     nn.ReLU(),
-                                     nn.Linear(128, out_dim)
-                                     )
+        mlp_down = mlp.MLP(mlp.MlpParams(128, out_dim, []))
+        self.ggnn_top = GrapTopGGNN(mlp_project_up, mlp_gate, mlp_down)
 
     def forward(self, graph: graph_datastructure.OneHotMolecularGraphs):
         """
@@ -52,9 +69,7 @@ class EncoderNet(nn.Module):
 
         node_features = self.ggnn(node_attr, adj_mats) # [b,v, h2]
 
-        graph_feats = self.ggnn_top(node_features)  # [b,h1]
-
-        mean_log_var = self.top_net(graph_feats)
+        mean_log_var = self.ggnn_top(node_features)  # [b,h1]
         return mean_log_var
 
 
@@ -73,6 +88,8 @@ class Decoder(base_parameterised_distribution.BaseParameterisedDistribution):
         self._tilde_structure: typing.Optional[graph_datastructure.LogitMolecularGraphs] = None
         self.run_graph_matching_flag = run_graph_matching_flag
 
+        self._logger: typing.Optional[logging_tools.LogHelper] = None
+
     def mode(self):
         return self._tilde_structure.calc_distributions_mode()
 
@@ -83,6 +100,21 @@ class Decoder(base_parameterised_distribution.BaseParameterisedDistribution):
             # this version is called NoGM in table 1 of paper.
             this_graph_matched = self._tilde_structure
         nll = this_graph_matched.neg_log_like(obs)
+
+        if self._logger is not None:
+            # NB this takes a bit of time but indicates the gain from using the graph matching algorithm.
+
+            if self.run_graph_matching_flag:
+                matched_nll = nll
+                unmatched_nll = self._tilde_structure.neg_log_like(obs)
+            else:
+                matched_nll = self._tilde_structure.return_matched_version_to_other(obs).neg_log_like(obs)
+                unmatched_nll = nll
+
+            self._logger.add_statistics({
+                'sum-nll_matched': matched_nll.sum().item(),
+                'sum-nll_unmatched': unmatched_nll.sum().item(),
+            })
         return nll
 
     def update(self, latent_z: torch.Tensor):
@@ -93,7 +125,7 @@ class Decoder(base_parameterised_distribution.BaseParameterisedDistribution):
 
 def make_gvae(latent_space_dim: int, max_num_nodes, cuda_details: utils.CudaDetails, run_graph_matching_flag: bool):
     # Encoder
-    encoder = nn_paramterised_dists.NNParamterisedDistribution(EncoderNet(64, cuda_details, T=3, out_dim=2 * latent_space_dim),
+    encoder = nn_paramterised_dists.NNParamterisedDistribution(EncoderNet(64, cuda_details, T=2, out_dim=2 * latent_space_dim),
                                                     shallow_distributions.IndependentGaussianDistribution())
 
     # Decoder

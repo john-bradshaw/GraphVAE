@@ -34,3 +34,4 @@ class SmilesDataset(data.Dataset):
         new_ds_test = cpy_and_set(test_indcs)
 
         return new_ds_train, new_ds_valid, new_ds_test
+

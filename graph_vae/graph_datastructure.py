@@ -88,6 +88,107 @@ class BaseMolecularGraphs:
         self.node_atr_matrices = self.node_atr_matrices.to(device)
         return self
 
+    def return_permuted(self, permutation_matrices):
+        """
+        :param permutation_matrices: [b, v, v]
+        """
+        batch_size = self.num_graphs
+        num_nodes = self.num_nodes
+
+        # ==================
+        # Permute the matrices
+        new_adj_mat = torch.bmm(permutation_matrices, self.adj_matrices_special_diag)
+        permutation_tranpsosed = permutation_matrices.permute(0, 2, 1)
+        new_adj_mat = torch.bmm(new_adj_mat, permutation_tranpsosed)
+
+        new_node_atr = torch.bmm(permutation_matrices, self.node_atr_matrices)
+
+        # the edge attribute one is easier to deal with if we first switch the dimensions
+        temp_edge_attr = self.edge_atr_tensors.permute(0,3,1,2).contiguous().view(-1, num_nodes, num_nodes)
+        new_edge_attr = torch.bmm(permutation_matrices.repeat_interleave(CHEM_DETAILS.num_bond_types, dim=0),temp_edge_attr)
+        new_edge_attr = torch.bmm(new_edge_attr, permutation_tranpsosed.repeat_interleave(CHEM_DETAILS.num_bond_types, dim=0))
+        new_edge_attr = new_edge_attr.view(batch_size, CHEM_DETAILS.num_bond_types, num_nodes, num_nodes)
+        new_edge_attr = new_edge_attr.permute(0,2,3,1)
+
+        return self.__class__(new_adj_mat, new_edge_attr, new_node_atr)
+
+    def _return_matching_permutation(self, adj, adj_tilde, node_attr, node_attr_tilde, edg, edg_tilde):
+        """
+        Works out a permutation from this one to other and returns this one in that permutations.
+        This other should be a fixed graph.
+        See section 3.4 of [1] and the appendix A.
+        """
+        with torch.no_grad():
+            s_tensor = self._calc_similairty_term_between_two_graphs(adj, adj_tilde, node_attr,
+                                                                     node_attr_tilde, edg, edg_tilde)
+            permutation_matrices = self._run_mpm(s_tensor)
+        return permutation_matrices
+
+    @torch.no_grad()
+    def _run_mpm(self, s_tensor):
+        batch_size, num_nodes, *_ = s_tensor.shape
+        # ==================
+        # Then we run MPM for a set number of iterations
+        # init x:
+        x = torch.full((batch_size, num_nodes, num_nodes), fill_value=1. / num_nodes, device=str(s_tensor.device),
+                       dtype=s_tensor.dtype)  # ^so that it starts with the row and column sums being correct
+
+        for iter in range(self.mpm_iterations):
+            for i in range(num_nodes):
+                for a in range(num_nodes):
+                    summed_max = torch.sum(
+                        torch.stack([torch.max(x[:, j, :] * s_tensor[:, i, j, a, :], dim=-1)[0]
+                                     for j in range(num_nodes) if j != i]),
+                        dim=0)
+                    x[:, i, a] = x[:, i, a] * s_tensor[:, i, i, a, a] + summed_max
+
+            x = x / torch.norm(x, dim=(1, 2), keepdim=True)
+
+        # ==================
+        # We run the Hungarian algorithm on each member of the batch
+        x = x.detach().cpu().numpy()
+        cost_matrices = -x
+        permutation_matrices = []
+        for cost_matrix in cost_matrices:
+            row_ind, col_ind = optimize.linear_sum_assignment(cost_matrix)
+            permute_other_to_self_matrix = np.zeros((num_nodes, num_nodes), dtype=np.float32)
+            permute_other_to_self_matrix[row_ind, col_ind] = 1.
+            permutation_matrices.append(permute_other_to_self_matrix)
+        permutation_matrices = np.stack(permutation_matrices)
+        permutation_matrices = torch.tensor(permutation_matrices).to(str(self.adj_matrices_special_diag.device))
+        return permutation_matrices
+
+    @torch.no_grad()
+    def _calc_similairty_term_between_two_graphs(self, adj, adj_tilde, node_attr, node_attr_tilde, edg, edg_tilde):
+        """
+        eqn 4.
+        """
+        # Get sizes.
+        batch_size = edg.shape[0]
+        assert batch_size == edg_tilde.shape[0]
+
+        num_nodes = edg.shape[1]
+        assert num_nodes == edg_tilde.shape[1]
+
+        # masks
+        diag_mat = torch.diag(torch.ones(num_nodes, dtype=torch.uint8, device=str(edg.device)))  # [v, v]
+        i_equal_j_mask = diag_mat[None, :, :, None, None].repeat(batch_size, 1, 1, num_nodes, num_nodes)  # [b,v,v,v,v]
+        a_equal_b_mask = diag_mat[None, None, None, :, :].repeat(batch_size, num_nodes, num_nodes, 1, 1)  # [b,v,v,v,v]
+
+        # First term.
+        term1 = torch.einsum("nijk,nabk,nij,nab,naa,nbb->nijab", edg, edg_tilde, adj, adj_tilde, adj_tilde, adj_tilde)
+        # ^ n is batch dimension
+        # now zero out according to the indicator function (De Morgan 1 to convert into or):
+        term1[i_equal_j_mask] = 0.
+        term1[a_equal_b_mask] = 0.
+
+        # Second term
+        term2 = torch.einsum("nik,nak,naa->nia", node_attr, node_attr_tilde, adj_tilde)
+        term2 = term2[:, :, None, :, None].repeat(1, 1, num_nodes, 1, num_nodes)
+        term2[~(i_equal_j_mask & a_equal_b_mask)] = 0.
+
+        s_tensor = term1 + term2
+        return s_tensor
 
 
 class OneHotMolecularGraphs(BaseMolecularGraphs):
@@ -204,6 +305,19 @@ class OneHotMolecularGraphs(BaseMolecularGraphs):
 
         return cls(adj_mat, edge_attr, node_attr)
 
+    def return_matched_version_to_other(self, other):
+        with torch.no_grad():
+            assert isinstance(other, OneHotMolecularGraphs)
+            # ==================
+            # First we create S -- we'll do this as a five dimensional tensor (first dim is batch dimension)
+            edg = other.edge_atr_tensors
+            edg_tilde = self.edge_atr_tensors
+            adj = other.adj_matrices_special_diag
+            adj_tilde = self.adj_matrices_special_diag
+            node_attr = other.node_atr_matrices
+            node_attr_tilde = self.node_atr_matrices, dim=-1
+        permutation = self._return_matching_permutation(adj, adj_tilde, node_attr, node_attr_tilde, edg, edg_tilde)
+        return self.return_permuted(permutation)
 
 
 class LogitMolecularGraphs(BaseMolecularGraphs):
@@ -215,8 +329,6 @@ class LogitMolecularGraphs(BaseMolecularGraphs):
 
     Stores data in Torch Tensors.
     """
-
-
 
     def calc_distributions_mode(self):
         """
@@ -307,7 +419,6 @@ class LogitMolecularGraphs(BaseMolecularGraphs):
 
         return OneHotMolecularGraphs(adj, edge_atr, node_atr)
 
-
     def neg_log_like(self, other: OneHotMolecularGraphs, lambda_a=1., lambda_f=1., lambda_e=1.):
         """
         The negative log likelihood of this distribution over graphs for the instance seen in Other
@@ -340,15 +451,15 @@ class LogitMolecularGraphs(BaseMolecularGraphs):
             a_norm_one = torch.sum(other.adj_matrices_special_diag, dim=[1,2], dtype=torch.float32)  # b
 
             node_attr_mask = match_nodes.view(-1)  # [bv]
-            node_idx = torch.arange(batch_size).repeat_interleave(num_nodes)
+            node_idx = torch.arange(batch_size, device=self.device_str).repeat_interleave(num_nodes)
             graph_idx_associated_with_considered_node = node_idx[node_attr_mask]
 
             # edge attribute tensor mask.
-            edge_mask = torch.bmm(match_nodes[:,:, None], match_nodes[:, None, :])
-            diag_mask = torch.eye(self.num_nodes, self.num_nodes, dtype=torch.uint8)[None, :, :].repeat(self.num_graphs, 1, 1)
+            edge_mask = match_nodes[:,:, None] * match_nodes[:, None, :]
+            diag_mask = torch.eye(self.num_nodes, self.num_nodes, dtype=torch.uint8, device=self.device_str)[None, :, :].repeat(self.num_graphs, 1, 1)
             edge_mask.masked_fill_(diag_mask, 0)
             edge_mask = edge_mask.view(-1)  # [bvv]
-            edge_idx = torch.arange(batch_size).repeat_interleave(num_nodes*num_nodes)
+            edge_idx = torch.arange(batch_size, device=self.device_str).repeat_interleave(num_nodes*num_nodes)
             graph_idx_associated_with_considered_edge = edge_idx[edge_mask]
 
         # Node attribute loss
@@ -378,16 +489,9 @@ class LogitMolecularGraphs(BaseMolecularGraphs):
         loss = lambda_a * loss1 + lambda_f * loss2 + lambda_e * loss3
         return loss
 
-
     def return_matched_version_to_other(self, other: OneHotMolecularGraphs):
-        """
-        Works out a permutation from this one to other and returns this one in that permutations.
-        This other should be a fixed graph.
-        See section 3.4 of [1] and the appendix A.
-        """
         with torch.no_grad():
             assert isinstance(other, OneHotMolecularGraphs)
-
             # ==================
             # First we create S -- we'll do this as a five dimensional tensor (first dim is batch dimension)
             edg = other.edge_atr_tensors
@@ -396,80 +500,8 @@ class LogitMolecularGraphs(BaseMolecularGraphs):
             adj_tilde = F.sigmoid(self.adj_matrices_special_diag)
             node_attr = other.node_atr_matrices
             node_attr_tilde = F.softmax(self.node_atr_matrices, dim=-1)
-
-            # Get sizes.
-            batch_size = edg.shape[0]
-            assert batch_size == edg_tilde.shape[0]
-
-            num_nodes = edg.shape[1]
-            assert num_nodes == edg_tilde.shape[1]
-
-            # masks
-            diag_mat = torch.diag(torch.ones(num_nodes, dtype=torch.uint8, device=str(edg.device)))  # [v, v]
-            i_equal_j_mask = diag_mat[None, :, :, None, None].repeat(batch_size, 1, 1, num_nodes, num_nodes) # [b,v,v,v,v]
-            a_equal_b_mask = diag_mat[None, None, None, :, :].repeat(batch_size,  num_nodes, num_nodes, 1, 1) # [b,v,v,v,v]
-
-            # First term.
-            term1 = torch.einsum("nijk,nabk,nij,nab,naa,nbb->nijab", edg, edg_tilde, adj, adj_tilde, adj_tilde, adj_tilde)
-            # ^ n is batch dimension
-            # now zero out according to the indicator function (De Morgan 1 to convert into or):
-            term1[i_equal_j_mask] = 0.
-            term1[a_equal_b_mask] = 0.
-
-            # Second term
-            term2 = torch.einsum("nik,nak,naa->nia", node_attr, node_attr_tilde, adj_tilde)
-            term2 = term2[:, :, None, :, None].repeat(1,1,num_nodes,1,num_nodes)
-            term2[~(i_equal_j_mask & a_equal_b_mask)] = 0.
-
-            s_tensor = term1 + term2
-
-            # ==================
-            # Then we run MPM for a set number of iterations
-            # init x:
-            x = torch.full((batch_size, num_nodes, num_nodes), fill_value=1./num_nodes, device=str(s_tensor.device),
-                           dtype=s_tensor.dtype)  # ^so that it starts with the row and column sums being correct
-
-            for iter in range(self.mpm_iterations):
-                for i in range(num_nodes):
-                    for a in range(num_nodes):
-                        summed_max = torch.sum(
-                                        torch.stack([torch.max(x[:, j, :] * s_tensor[:, i, j, a, :], dim=-1)[0]
-                                                     for j in range(num_nodes) if j != i]),
-                            dim=0)
-                        x[:, i, a] = x[:, i, a] * s_tensor[:, i, i, a, a] + summed_max
-
-                x = x / torch.norm(x, dim=(1,2), keepdim=True)
-
-
-            # ==================
-            # We run the Hungarian algorithm on each member of the batch
-            x = x.detach().cpu().numpy()
-            cost_matrices = -x
-            permutation_matrices = []
-            for cost_matrix in cost_matrices:
-                row_ind, col_ind = optimize.linear_sum_assignment(cost_matrix)
-                permute_other_to_self_matrix = np.zeros((num_nodes, num_nodes), dtype=np.float32)
-                permute_other_to_self_matrix[row_ind, col_ind] = 1.
-                permutation_matrices.append(permute_other_to_self_matrix)
-            permutation_matrices = np.stack(permutation_matrices)
-            permutation_matrices = torch.tensor(permutation_matrices).to(str(self.adj_matrices_special_diag.device))
-
-        # ==================
-        # Permute the matrices
-        new_adj_mat = torch.bmm(permutation_matrices, self.adj_matrices_special_diag)
-        permutation_tranpsosed = permutation_matrices.permute(0, 2, 1)
-        new_adj_mat = torch.bmm(new_adj_mat, permutation_tranpsosed)
-
-        new_node_atr = torch.bmm(permutation_matrices, self.node_atr_matrices)
-
-        # the edge attribute one is easier to deal with if we first switch the dimensions
-        temp_edge_attr = self.edge_atr_tensors.permute(0,3,1,2).view(-1, num_nodes, num_nodes)
-        new_edge_attr = torch.bmm(permutation_matrices.repeat_interleave(CHEM_DETAILS.num_bond_types, dim=0),temp_edge_attr)
-        new_edge_attr = torch.bmm(new_edge_attr, permutation_tranpsosed.repeat_interleave(CHEM_DETAILS.num_bond_types, dim=0))
-        new_edge_attr = new_edge_attr.view(batch_size, CHEM_DETAILS.num_bond_types, num_nodes, num_nodes)
-        new_edge_attr = new_edge_attr.permute(0,2,3,1)
-
-        return self.__class__(new_adj_mat, new_edge_attr, new_node_atr)
+        permutation = self._return_matching_permutation(adj, adj_tilde, node_attr, node_attr_tilde, edg, edg_tilde)
+        return self.return_permuted(permutation)
 
     @classmethod
     def create_from_nn_prediction(cls, packed_tensor, max_node_size: int):
@@ -509,6 +541,4 @@ class LogitMolecularGraphs(BaseMolecularGraphs):
         node_atr_logits = node_atr_logits.view(batch_size, max_node_size, CHEM_DETAILS.num_node_types)
 
         return cls(adj_mat, edge_attribute_tensor, node_atr_logits)
-
-
 

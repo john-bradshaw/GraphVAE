@@ -104,7 +104,7 @@ def mpm_test(smi_list, adj_noise, node_attr_noise, edge_atr_noise, rng: np.rando
     1. We Load in SMILES_LIST as OH graph.
     2. Randomly permute the points.
     3. Add Gaussian noise to the relevant tensors and re-normalize/truncate.
-    4. Run matching to permuation stage -- check that permuatations are the inverse of the original permutations
+    4. Run matching to permutation stage -- but due to symmetry do this via checking individual components
     we applied!
     """
     torch.manual_seed(rng.choice(10000))
@@ -117,6 +117,7 @@ def mpm_test(smi_list, adj_noise, node_attr_noise, edge_atr_noise, rng: np.rando
 
     # 3.
     # adjacency matrices
+    #FIXME: Do below on a copy.
     if adj_noise != 0.:
         permuted_ds.adj_matrices_special_diag = (permuted_ds.adj_matrices_special_diag +
                                                  adj_noise * torch.randn(*permuted_ds.adj_matrices_special_diag.shape))
@@ -149,12 +150,19 @@ def mpm_test(smi_list, adj_noise, node_attr_noise, edge_atr_noise, rng: np.rando
     # 4.
     permutation_found = permuted_ds._return_matching_permutation(ds.adj_matrices_special_diag, permuted_ds.adj_matrices_special_diag,
                     ds.node_atr_matrices, permuted_ds.node_atr_matrices, ds.edge_atr_tensors, permuted_ds.edge_atr_tensors)
+    repermuted_permuted_ds = permuted_ds.return_permuted(permutation_found)
+    rp_ds = repermuted_permuted_ds
 
     # 5. Check matching
-    should_be_identities = torch.bmm(permutation_found, permutations)
-    matches = should_be_identities == torch.eye(max_node_size)[None, :, :]
-    matches = matches.view(ds.num_graphs, max_node_size*max_node_size)
-    matches = matches.all(dim=1)
+    bsize = rp_ds.adj_matrices_special_diag.shape[0]
+    adj_matching = (rp_ds.adj_matrices_special_diag.contiguous().view(bsize, -1) ==
+                    ds.adj_matrices_special_diag.contiguous().view(bsize, -1)).all(dim=-1)
+    node_attr_matching = (rp_ds.node_atr_matrices.contiguous().view(bsize, -1) ==
+                          ds.node_atr_matrices.contiguous().view(bsize, -1)).all(dim=-1)
+    edge_matching = (rp_ds.edge_atr_tensors.contiguous().view(bsize, -1) ==
+                     ds.edge_atr_tensors.contiguous().view(bsize, -1)).all(dim=-1)
+    matches = adj_matching & node_attr_matching & edge_matching
+
     proportion_matched = torch.mean(matches, dtype=torch.float32).item()
 
     return proportion_matched
@@ -181,9 +189,34 @@ def test_to_and_from_smi():
 
 
 def test_matching_no_noise():
-    prop = mpm_test(SMILES_LIST_LARGER[:20], 0., 0., 0., np.random.RandomState(45), max_node_size=15)
+    prop = mpm_test(SMILES_LIST_LARGER, 0., 0., 0., np.random.RandomState(45), max_node_size=15)
     assert prop > 0.9
 
+
+def test_permutation():
+    """tests permutation by permuting and then permuting by transpose to make sure back to original."""
+    # Setup and Permute once
+    max_num_nodes = 9
+    rng = np.random.RandomState(100)
+    ds = graph_datastructure.OneHotMolecularGraphs.create_from_smiles_list(SMILES_LIST, padding_size=max_num_nodes)
+    permuted_ds, permutations = randomly_permute(ds, max_num_nodes, np.random.RandomState(rng.choice(10000)))
+
+    # Now permute back
+    permutations_t = permutations.permute(0,2,1)
+    rp_ds = permuted_ds.return_permuted(permutations_t)
+
+    # Now check match
+    bsize = rp_ds.adj_matrices_special_diag.shape[0]
+    adj_matching = (rp_ds.adj_matrices_special_diag.contiguous().view(bsize, -1) ==
+                    ds.adj_matrices_special_diag.contiguous().view(bsize, -1)).all(dim=-1)
+    node_attr_matching = (rp_ds.node_atr_matrices.contiguous().view(bsize, -1) ==
+                          ds.node_atr_matrices.contiguous().view(bsize, -1)).all(dim=-1)
+    edge_matching = (rp_ds.edge_atr_tensors.contiguous().view(bsize, -1) ==
+                     ds.edge_atr_tensors.contiguous().view(bsize, -1)).all(dim=-1)
+    matches = adj_matching & node_attr_matching & edge_matching
+
+    proportion_matched = torch.mean(matches, dtype=torch.float32).item()
+    assert proportion_matched == 1.
 
 
 
