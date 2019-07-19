@@ -9,6 +9,7 @@ from torch.nn import functional as F
 
 from rdkit import Chem
 
+
 class ChemicalDetails:
     def __init__(self):
         self.atom_types =  ['C', 'N', 'O', 'S', 'Se', 'Si', 'I', 'F', 'Cl', 'Br']
@@ -121,35 +122,15 @@ class BaseMolecularGraphs:
         with torch.no_grad():
             s_tensor = self._calc_similarity_term_between_two_graphs(adj, adj_tilde, node_attr,
                                                                      node_attr_tilde, edg, edg_tilde)
-            permutation_matrices = self._run_mpm(s_tensor)
+            correpondence_matrix = self._run_mpm(s_tensor)
+            permutation_matrices = self._run_hungarian_on_correspondence_matrix(correpondence_matrix)
         return permutation_matrices
 
     @torch.no_grad()
-    def _run_mpm(self, s_tensor):
-        batch_size, num_nodes, *_ = s_tensor.shape
-        # ==================
-        # Then we run MPM for a set number of iterations
-        # init x:
-        x = torch.full((batch_size, num_nodes, num_nodes), fill_value=1. / num_nodes, device=str(s_tensor.device),
-                       dtype=s_tensor.dtype)  # ^so that it starts with the row and column sums being correct
+    def _run_hungarian_on_correspondence_matrix(self, x):
+        batchsize, num_nodes, _ = x.shape
 
-        for iter in range(self.mpm_iterations):
-            x_new = torch.empty_like(x)
-            for i in range(num_nodes):
-                for a in range(num_nodes):
-                    summed_max = \
-                        torch.sum(
-                            torch.stack([
-                                torch.max(x[:, j, :] * s_tensor[:, i, j, a, :], dim=-1)[0]  # [b]
-                                for j in range(num_nodes) if j != i
-                            ]),  # [v,b]
-                        dim=0)  # [b]
-                    x_new[:, i, a] = x[:, i, a] * s_tensor[:, i, i, a, a] + summed_max
-
-            x = x_new / torch.norm(x_new, dim=(1, 2), keepdim=True)
-
-        # ==================
-        # We run the Hungarian algorithm on each member of the batch
+        # We run the Hungarian algorithm on each member of the batch one by one using scipy.
         x = x.detach().cpu().numpy()
         cost_matrices = -x
         permutation_matrices = []
@@ -163,9 +144,40 @@ class BaseMolecularGraphs:
         return permutation_matrices
 
     @torch.no_grad()
+    def _run_mpm(self, s_tensor):
+        # nb s_tensor should be geq than 0.
+
+        batch_size, num_nodes, *_ = s_tensor.shape
+
+        # init x:
+        x = torch.full((batch_size, num_nodes, num_nodes), fill_value=1. / num_nodes, device=str(s_tensor.device),
+                       dtype=s_tensor.dtype)  # ^so that it starts with the row and column sums being correct
+
+        # Create some masks/arrays that will be used to zero out the correct nodes. Do this outside loop as unchange
+        # each iteration.
+        diag_mask1 = torch.eye(self.num_nodes, self.num_nodes, dtype=torch.uint8,
+                              device=self.device_str)[None, :, :, None].repeat(self.num_graphs, 1, 1, self.num_nodes)
+
+        a_eq_b_ = torch.ones(self.num_nodes, self.num_nodes, device=self.device_str, dtype=s_tensor.dtype)
+        a_eq_b_[torch.eye(self.num_nodes, self.num_nodes, dtype=torch.uint8,
+                  device=self.device_str)] = 0.  # turn off diagonal
+        a_eq_b_ = a_eq_b_[None, None, None, :, :].repeat(batch_size, num_nodes, num_nodes, 1, 1)
+
+        # Now we run the MPM iterations. See Appendix A of paper for details of each step.
+        for iter in range(self.mpm_iterations):
+            max_ = torch.max(x[:, None, :, None, :] * s_tensor[:, :, :, :, :] * a_eq_b_, dim=-1)[0]  # [b,v,v,v]
+            max_[diag_mask1] = 0  # for i = j
+            summed_max = torch.sum(max_, dim=2)  # [b,v,v]
+
+            x[:, :, :] = torch.einsum("nia,niiaa->nia", x, s_tensor) + summed_max
+
+            x = x / torch.norm(x, dim=(1, 2), keepdim=True)
+        return x
+
+    @torch.no_grad()
     def _calc_similarity_term_between_two_graphs(self, adj, adj_tilde, node_attr, node_attr_tilde, edg, edg_tilde):
         """
-        eqn 4.
+        eqn 4. We keep in a 5 dimensional paper
         """
         # Get sizes.
         batch_size = edg.shape[0]
@@ -174,7 +186,7 @@ class BaseMolecularGraphs:
         num_nodes = edg.shape[1]
         assert num_nodes == edg_tilde.shape[1]
 
-        # masks
+        # masks  -- useful for doing the Iverson bracket parts
         diag_mat = torch.diag(torch.ones(num_nodes, dtype=torch.uint8, device=str(edg.device)))  # [v, v]
         i_equal_j_mask = diag_mat[None, :, :, None, None].repeat(batch_size, 1, 1, num_nodes, num_nodes)  # [b,v,v,v,v]
         a_equal_b_mask = diag_mat[None, None, None, :, :].repeat(batch_size, num_nodes, num_nodes, 1, 1)  # [b,v,v,v,v]
@@ -447,7 +459,7 @@ class LogitMolecularGraphs(BaseMolecularGraphs):
         # We now work out which of the attribute terms we are actually interested in.
         # In paper it says loss is only taken over the matched attribute nodes so do not want to include loss over all.
 
-        # Start with creating the masks for selecting the right parts to take loss over
+        # Start with creating the masks for selecting the right parts to take loss over (ie matched attributes)
         with torch.no_grad():
             num_nodes = self.num_nodes
             match_nodes = torch.diagonal(other.adj_matrices_special_diag, dim1=1, dim2=2) == 1.  # [b, v]
@@ -459,9 +471,10 @@ class LogitMolecularGraphs(BaseMolecularGraphs):
             graph_idx_associated_with_considered_node = node_idx[node_attr_mask]
 
             # edge attribute tensor mask.
-            edge_mask = match_nodes[:,:, None] * match_nodes[:, None, :]
-            diag_mask = torch.eye(self.num_nodes, self.num_nodes, dtype=torch.uint8, device=self.device_str)[None, :, :].repeat(self.num_graphs, 1, 1)
-            edge_mask.masked_fill_(diag_mask, 0)
+            # in Simonovksy and Komodakis paper there is a sum over i ne j.
+            # However, in this implementation I've since changed this sum to just the edges which are
+            # actually on as no good signal for right class for "all off" edge attributes.
+            edge_mask = (other.edge_atr_tensors == 1.).any(dim=-1)
             edge_mask = edge_mask.view(-1)  # [bvv]
             edge_idx = torch.arange(batch_size, device=self.device_str).repeat_interleave(num_nodes*num_nodes)
             graph_idx_associated_with_considered_edge = edge_idx[edge_mask]
@@ -475,7 +488,6 @@ class LogitMolecularGraphs(BaseMolecularGraphs):
         loss2 = (torch.scatter_add(torch.zeros(batch_size, dtype=loss2.dtype, device=loss2.device), 0, graph_idx_associated_with_considered_node, loss2)
                  / num_nodes_active)
 
-
         # And edge attribute
         edge_num_classes = self.edge_atr_tensors.shape[-1]
         pred_edge_logits = self.edge_atr_tensors.contiguous().view(-1, edge_num_classes)
@@ -485,8 +497,7 @@ class LogitMolecularGraphs(BaseMolecularGraphs):
 
         loss3 = torch.scatter_add(torch.zeros(batch_size, dtype=loss3.dtype, device=loss3.device), 0, graph_idx_associated_with_considered_edge, loss3)
         loss3 = loss3 / (a_norm_one - num_nodes_active)
-        # ^ nb note that we are dividing through by the number of edges that should be on even though we are
-        # testing for all the attributes including the edges that are off. This is to match eqn2.
+        # ^ nb note that we are dividing through by the number of edges that should be on.
 
         # ==================
         # Finally sum together!

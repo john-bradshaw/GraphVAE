@@ -13,13 +13,10 @@ from autoencoders import logging_tools
 
 from graph_neural_networks.pad_pattern import ggnn_pad
 from graph_neural_networks.ggnn_general import ggnn_base
-from graph_neural_networks.ggnn_general import graph_tops
 from graph_neural_networks.core import utils
 from graph_neural_networks.core import mlp
 
 from . import graph_datastructure
-
-
 
 class GrapTopGGNN(nn.Module):
 

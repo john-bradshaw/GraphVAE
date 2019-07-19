@@ -1,5 +1,6 @@
 
 import pytest
+from numpy.distutils.system_info import numarray_info
 
 from rdkit import Chem
 import numpy as np
@@ -177,7 +178,7 @@ def test_to_and_from_smi():
     smiles_back_canon = [canonicalize(s) for s in smiles_back]
     assert orig_smiles_canon == smiles_back_canon
 
-@pytest.mark.slow
+
 def test_matching_no_noise():
     """
     permutes the adj matrices etc and makes sure that it can reassemble them using the matched algorithm.
@@ -243,6 +244,7 @@ def test_similarity_function():
     print("checking equal...")
     np.testing.assert_array_equal(s_tensor_calculated, s_tensor_via_loop)
 
+
 def test_permutation():
     """tests permutation by permuting and then permuting by transpose to make sure back to original."""
     # Setup and Permute once
@@ -269,4 +271,52 @@ def test_permutation():
     assert proportion_matched == 1.
 
 
+def test_mpm():
+    """
+    tests that I wrote the array version of mpm correctly by assessing against a slow multiple for loop version written
+    in numpy.
+    """
+    num_graphs = 5
+    num_nodes = 15
+    ds = graph_datastructure.LogitMolecularGraphs(torch.ones(num_graphs, num_nodes, num_nodes),
+                                                  torch.ones(num_graphs, num_nodes, num_nodes, graph_datastructure.CHEM_DETAILS.num_bond_types),
+                                                  torch.ones(num_graphs, num_nodes, graph_datastructure.CHEM_DETAILS.num_node_types))
+    # ^ dummy graph with no information in it.
+
+    s_tensor = np.load('s_tensor_for_testing.npy')[:num_graphs]  # one I prepared earlier! This one only has ones/zeros in it.
+    # Comes from SMILES LARGER LIST.
+    num_iter = ds.mpm_iterations
+    batch_size, num_nodes, nn2, nn3, nn4 = s_tensor.shape
+    assert {num_nodes, nn2, nn3, nn4} == {num_nodes}, "all should be 9 number of  nodes."
+
+    print("Evaluating via loop (this is slow...)")
+    x_arr_from_np_loop = 1./num_nodes * np.ones((batch_size, num_nodes, num_nodes))
+    for n in range(batch_size):
+
+        x_sub = x_arr_from_np_loop[n]
+        for iter in range(num_iter):
+
+            x_temp = np.empty_like(x_sub)
+            # Over indices.
+            for i in range(num_nodes):
+                for a in range(num_nodes):
+
+                    sum_ = 0.
+                    for j in range(num_nodes):
+                        if j == i:
+                            continue
+                        sum_ += np.max([x_sub[j,b]*s_tensor[n,i,j,a,b] for b in range(num_nodes) if b != a])
+
+                    x_temp[i, a] = x_sub[i, a] * s_tensor[n, i, i, a, a] + sum_
+
+            x_temp = x_temp/np.linalg.norm(x_temp, ord='fro')
+            x_sub = x_temp
+
+        x_arr_from_np_loop[n] = x_sub
+
+    print("Evaluating via class")
+    x_arr_from_ds = ds._run_mpm(torch.from_numpy(s_tensor)).numpy()
+
+    print("Done!")
+    np.testing.assert_array_almost_equal(x_arr_from_np_loop, x_arr_from_ds)
 
