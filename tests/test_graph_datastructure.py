@@ -1,4 +1,6 @@
 
+import pytest
+
 from rdkit import Chem
 import numpy as np
 import torch
@@ -93,7 +95,6 @@ def randomly_permute(ds: graph_datastructure.BaseMolecularGraphs, max_num_nodes:
     return ds, all_perms
 
 
-
 @torch.no_grad()
 def mpm_test(smi_list, adj_noise, node_attr_noise, edge_atr_noise, rng: np.random.RandomState, max_node_size=15):
     """
@@ -104,7 +105,8 @@ def mpm_test(smi_list, adj_noise, node_attr_noise, edge_atr_noise, rng: np.rando
     1. We Load in SMILES_LIST as OH graph.
     2. Randomly permute the points.
     3. Add Gaussian noise to the relevant tensors and re-normalize/truncate.
-    4. Run matching to permutation stage -- but due to symmetry do this via checking individual components
+    4. Run matching to permutation stage -- but due to equivalent nodes being swapped do this via checking
+     individual components rather than checking permutation found is its own inverse.
     we applied!
     """
     torch.manual_seed(rng.choice(10000))
@@ -117,35 +119,10 @@ def mpm_test(smi_list, adj_noise, node_attr_noise, edge_atr_noise, rng: np.rando
 
     # 3.
     # adjacency matrices
-    #FIXME: Do below on a copy.
-    if adj_noise != 0.:
-        permuted_ds.adj_matrices_special_diag = (permuted_ds.adj_matrices_special_diag +
-                                                 adj_noise * torch.randn(*permuted_ds.adj_matrices_special_diag.shape))
-        normalized_probs = torch.clamp(permuted_ds.adj_matrices_special_diag, 0., 1.)
-        permuted_ds.adj_matrices_special_diag = normalized_probs
-        #FIXME: match top and bottom halves
-        raise NotImplementedError("Not finished implementing: fix fixmes")
-
-
-    # node attribute matrices.
-    if node_attr_noise != 0.:
-        permuted_ds.node_atr_matrices = (permuted_ds.node_atr_matrices +
-                                                 node_attr_noise * torch.randn(*permuted_ds.node_atr_matrices.shape))
-        permuted_ds.node_atr_matrices = torch.relu(permuted_ds.node_atr_matrices)
-        permuted_ds.node_atr_matrices = permuted_ds.node_atr_matrices / permuted_ds.node_atr_matrices.sum(dim=-1, keepdim=True)
-        #FIXME: possible divide by zero
-        raise NotImplementedError("Not finished implementing: fix fixmes")
-
-    # edge attribute tensors.
-    if edge_atr_noise != 0.:
-        new_edge_attr = (permuted_ds.edge_atr_tensors +
-                                                 edge_atr_noise * torch.randn(*permuted_ds.edge_atr_tensors.shape))
-        new_edge_attr = torch.relu(new_edge_attr)
-        new_edge_attr = new_edge_attr / new_edge_attr.sum(dim=-1, keepdim=True)
-        permuted_ds.edge_atr_tensors = new_edge_attr
-        #FIXME: possible divide by zero
-        # FIXME: match top and bottom halves
-        raise NotImplementedError("Not finished implementing: fix fixmes")
+    # ADd noise
+    # Clip, and re-normalize
+    # reset diagonals when important.
+    assert {adj_noise, node_attr_noise, edge_atr_noise} == {0.}, "Noisy perturbation version not implemented yet"
 
     # 4.
     permutation_found = permuted_ds._return_matching_permutation(ds.adj_matrices_special_diag, permuted_ds.adj_matrices_special_diag,
@@ -154,16 +131,29 @@ def mpm_test(smi_list, adj_noise, node_attr_noise, edge_atr_noise, rng: np.rando
     rp_ds = repermuted_permuted_ds
 
     # 5. Check matching
+    # I'm not actually too sure what the matching accuracies reported in the paper relate to.
+    # Reasonably certain they are not looking at complete graph matches as they report decimal points for the percentages
+    # but have evaluated only on 100 graphs.
+    # Below I look at the mean of all nodes, edges and adjacency matrix
+    # elements after converting from one-hot. This means we are assessing the matching of edge attributes that are
+    # not necessary used due to the corresponding point in the adjacency matrix being zero...
     bsize = rp_ds.adj_matrices_special_diag.shape[0]
-    adj_matching = (rp_ds.adj_matrices_special_diag.contiguous().view(bsize, -1) ==
-                    ds.adj_matrices_special_diag.contiguous().view(bsize, -1)).all(dim=-1)
-    node_attr_matching = (rp_ds.node_atr_matrices.contiguous().view(bsize, -1) ==
-                          ds.node_atr_matrices.contiguous().view(bsize, -1)).all(dim=-1)
-    edge_matching = (rp_ds.edge_atr_tensors.contiguous().view(bsize, -1) ==
-                     ds.edge_atr_tensors.contiguous().view(bsize, -1)).all(dim=-1)
-    matches = adj_matching & node_attr_matching & edge_matching
 
-    proportion_matched = torch.mean(matches, dtype=torch.float32).item()
+    adj_matching = (rp_ds.adj_matrices_special_diag.contiguous().view(bsize, -1) ==
+                    ds.adj_matrices_special_diag.contiguous().view(bsize, -1)).type(torch.float32)
+    num_adjs = adj_matching.shape[1]
+
+    node_attr_matching = (rp_ds.node_atr_matrices.contiguous().argmax(dim=-1).contiguous().view(bsize, -1) ==
+                          ds.node_atr_matrices.contiguous().argmax(dim=-1).contiguous().view(bsize, -1)).type(torch.float32)
+    node_attr_num = node_attr_matching.shape[1]
+
+    # nb contiguous needed becuase argmax on all zero rows will different otherwise.
+    edge_matching = (rp_ds.edge_atr_tensors.contiguous().argmax(dim=-1).view(bsize, -1) ==
+                     ds.edge_atr_tensors.contiguous().argmax(dim=-1).contiguous().view(bsize, -1)).type(torch.float32)
+    edge_matching_num = edge_matching.shape[1]
+
+    proportion_matched = adj_matching.mean() * num_adjs + node_attr_matching.mean() * node_attr_num + edge_matching.mean() * edge_matching_num
+    proportion_matched = proportion_matched / (num_adjs + node_attr_num + edge_matching_num)
 
     return proportion_matched
 
@@ -187,11 +177,71 @@ def test_to_and_from_smi():
     smiles_back_canon = [canonicalize(s) for s in smiles_back]
     assert orig_smiles_canon == smiles_back_canon
 
-
+@pytest.mark.slow
 def test_matching_no_noise():
+    """
+    permutes the adj matrices etc and makes sure that it can reassemble them using the matched algorithm.
+    """
     prop = mpm_test(SMILES_LIST_LARGER, 0., 0., 0., np.random.RandomState(45), max_node_size=15)
     assert prop > 0.9
 
+
+def test_similarity_function():
+    """
+    tests my use of einsum! by checking the results against coding out the loop by hand.
+    """
+    # set seeds
+    rng = np.random.RandomState(45)
+    torch.manual_seed(rng.choice(10000))
+    max_node_size = 15
+
+    # Create graph and premuted graph to assess the similarity function on.
+    ds = graph_datastructure.OneHotMolecularGraphs.create_from_smiles_list(SMILES_LIST, padding_size=max_node_size)
+    permuted_ds, _ = randomly_permute(ds, max_node_size, np.random.RandomState(rng.choice(10000)))
+
+    adj = ds.adj_matrices_special_diag
+    adj_tilde = permuted_ds.adj_matrices_special_diag
+    edge_attr = ds.edge_atr_tensors
+    edge_attr_tilde = permuted_ds.edge_atr_tensors
+    node_attr = ds.node_atr_matrices
+    node_attr_tilde  = permuted_ds.node_atr_matrices
+
+    # Get the calculated s_tensor
+    print("Doing it via einsum")
+    s_tensor_calculated = permuted_ds._calc_similarity_term_between_two_graphs(adj, adj_tilde, node_attr, node_attr_tilde,
+                                                                    edge_attr, edge_attr_tilde).numpy()
+
+    # Now do the same thing via numpy and a loop
+    print("Doing it via for loop")
+    adj = adj.numpy()
+    adj_tilde = adj_tilde.numpy()
+    edge_attr = edge_attr.numpy()
+    edge_attr_tilde = edge_attr_tilde.numpy()
+    node_attr = node_attr.numpy()
+    node_attr_tilde = node_attr_tilde.numpy()
+
+    batchsize, num_nodes, num_nodes_p2 = adj.shape
+    assert num_nodes == num_nodes_p2
+    assert num_nodes == adj_tilde.shape[1]
+    assert num_nodes == adj_tilde.shape[2]
+    s_tensor_via_loop = np.zeros((batchsize, num_nodes, num_nodes, num_nodes, num_nodes), dtype=np.float32)
+
+    for n in range(batchsize):
+        for i in range(num_nodes):
+            for j in range(num_nodes):
+                for a in range(num_nodes):
+                    for b in range(num_nodes):
+                        term = 0.
+                        if (i != j) and (a!= b):
+                            term += ((edge_attr[n, i,j, :] @ edge_attr_tilde[n,a,b]) * adj[n, i, j] * adj_tilde[n,a,b]
+                                * adj_tilde[n,a,a] * adj_tilde[n,b,b])
+                        if (i == j) and (a == b):
+                            term += ((node_attr[n,i,:] @ node_attr_tilde[n,a,:]) * adj_tilde[n,a,a])
+
+                        s_tensor_via_loop[n, i, j, a, b] = term
+
+    print("checking equal...")
+    np.testing.assert_array_equal(s_tensor_calculated, s_tensor_via_loop)
 
 def test_permutation():
     """tests permutation by permuting and then permuting by transpose to make sure back to original."""
@@ -217,7 +267,6 @@ def test_permutation():
 
     proportion_matched = torch.mean(matches, dtype=torch.float32).item()
     assert proportion_matched == 1.
-
 
 
 

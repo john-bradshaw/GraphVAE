@@ -110,7 +110,7 @@ class BaseMolecularGraphs:
         new_edge_attr = new_edge_attr.view(batch_size, CHEM_DETAILS.num_bond_types, num_nodes, num_nodes)
         new_edge_attr = new_edge_attr.permute(0,2,3,1)
 
-        return self.__class__(new_adj_mat, new_edge_attr, new_node_atr)
+        return self.__class__(new_adj_mat.contiguous(), new_edge_attr.contiguous(), new_node_atr.contiguous())
 
     def _return_matching_permutation(self, adj, adj_tilde, node_attr, node_attr_tilde, edg, edg_tilde):
         """
@@ -119,7 +119,7 @@ class BaseMolecularGraphs:
         See section 3.4 of [1] and the appendix A.
         """
         with torch.no_grad():
-            s_tensor = self._calc_similairty_term_between_two_graphs(adj, adj_tilde, node_attr,
+            s_tensor = self._calc_similarity_term_between_two_graphs(adj, adj_tilde, node_attr,
                                                                      node_attr_tilde, edg, edg_tilde)
             permutation_matrices = self._run_mpm(s_tensor)
         return permutation_matrices
@@ -134,15 +134,19 @@ class BaseMolecularGraphs:
                        dtype=s_tensor.dtype)  # ^so that it starts with the row and column sums being correct
 
         for iter in range(self.mpm_iterations):
+            x_new = torch.empty_like(x)
             for i in range(num_nodes):
                 for a in range(num_nodes):
-                    summed_max = torch.sum(
-                        torch.stack([torch.max(x[:, j, :] * s_tensor[:, i, j, a, :], dim=-1)[0]
-                                     for j in range(num_nodes) if j != i]),
-                        dim=0)
-                    x[:, i, a] = x[:, i, a] * s_tensor[:, i, i, a, a] + summed_max
+                    summed_max = \
+                        torch.sum(
+                            torch.stack([
+                                torch.max(x[:, j, :] * s_tensor[:, i, j, a, :], dim=-1)[0]  # [b]
+                                for j in range(num_nodes) if j != i
+                            ]),  # [v,b]
+                        dim=0)  # [b]
+                    x_new[:, i, a] = x[:, i, a] * s_tensor[:, i, i, a, a] + summed_max
 
-            x = x / torch.norm(x, dim=(1, 2), keepdim=True)
+            x = x_new / torch.norm(x_new, dim=(1, 2), keepdim=True)
 
         # ==================
         # We run the Hungarian algorithm on each member of the batch
@@ -159,7 +163,7 @@ class BaseMolecularGraphs:
         return permutation_matrices
 
     @torch.no_grad()
-    def _calc_similairty_term_between_two_graphs(self, adj, adj_tilde, node_attr, node_attr_tilde, edg, edg_tilde):
+    def _calc_similarity_term_between_two_graphs(self, adj, adj_tilde, node_attr, node_attr_tilde, edg, edg_tilde):
         """
         eqn 4.
         """
@@ -467,7 +471,7 @@ class LogitMolecularGraphs(BaseMolecularGraphs):
         node_logits = self.node_atr_matrices.contiguous().view(-1, node_num_classes) # [bv, h]
         node_logits = node_logits[node_attr_mask]
         true_node = other.node_atr_matrices.view(-1, node_num_classes)[node_attr_mask]
-        loss2 = F.cross_entropy(node_logits, true_node.argmax(dim=1), reduction='none')
+        loss2 = F.cross_entropy(node_logits, true_node.contiguous().argmax(dim=1), reduction='none')
         loss2 = (torch.scatter_add(torch.zeros(batch_size, dtype=loss2.dtype, device=loss2.device), 0, graph_idx_associated_with_considered_node, loss2)
                  / num_nodes_active)
 
@@ -477,7 +481,7 @@ class LogitMolecularGraphs(BaseMolecularGraphs):
         pred_edge_logits = self.edge_atr_tensors.contiguous().view(-1, edge_num_classes)
         pred_edge_logits = pred_edge_logits[edge_mask]
         true_edge = other.edge_atr_tensors.view(-1, edge_num_classes)[edge_mask]
-        loss3 = F.cross_entropy(pred_edge_logits, true_edge.argmax(dim=1), reduction='none')
+        loss3 = F.cross_entropy(pred_edge_logits, true_edge.contiguous().argmax(dim=1), reduction='none')
 
         loss3 = torch.scatter_add(torch.zeros(batch_size, dtype=loss3.dtype, device=loss3.device), 0, graph_idx_associated_with_considered_edge, loss3)
         loss3 = loss3 / (a_norm_one - num_nodes_active)

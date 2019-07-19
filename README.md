@@ -3,7 +3,7 @@
 My implementation of [1].
 This implementation is based  on the one at https://github.com/JiaxuanYou/graph-generation [2], but with a sole
 focus on molecular graphs.
-Note that we do not completely match the hyperparameters/architectures suggested in [1].
+Note that we do not completely match the hyper-parameters/architectures suggested in [1].
 
 1. Simonovsky M and Komodakis N (2018)
  GraphVAE: Towards Generation of Small Graphs Using Variational Autoencoders. 
@@ -11,7 +11,12 @@ Note that we do not completely match the hyperparameters/architectures suggested
 2. Jiaxuan You*, Rex Ying*, Xiang Ren, William L. Hamilton, Jure Leskovec, 
 GraphRNN: Generating Realistic Graphs with Deep Auto-regressive Model (ICML 2018)
  
-## Notation
+ 
+ 
+ 
+## Notation in comments
+Tried to use the following notation consistently.
+
 `b` the batch size  
 `e` the number of edge types  
 `v` the number of nodes for adjacency matrix in one graph  
@@ -22,6 +27,6 @@ GraphRNN: Generating Realistic Graphs with Deep Auto-regressive Model (ICML 2018
 `g` the number of groups
 
 
-# TODOS:
-[] debug the vae model: especially check the graph matching part  
-[] Write the sample script. 
+## Training
+scripts/train_graphvae.py
+
