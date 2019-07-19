@@ -73,7 +73,8 @@ class BaseMolecularGraphs:
     @classmethod
     def get_data_locations_in_packed_form(cls, max_node_size):
         """
-        :param max_node_size: number of nodes we expect the packed data to reperesent
+        packed form is when we have one vector per graph by flattening all the parts of the necessary tensors.
+        :param max_node_size: number of nodes we expect the packed data to represent
         """
         # Work out the indices for which the different data lies
         num_indcs_for_adj_mat = max_node_size * (max_node_size + 1) // 2
@@ -96,14 +97,15 @@ class BaseMolecularGraphs:
         batch_size = self.num_graphs
         num_nodes = self.num_nodes
 
-        # ==================
-        # Permute the matrices
+        # adj
         new_adj_mat = torch.bmm(permutation_matrices, self.adj_matrices_special_diag)
         permutation_tranpsosed = permutation_matrices.permute(0, 2, 1)
         new_adj_mat = torch.bmm(new_adj_mat, permutation_tranpsosed)
 
+        # node attr.
         new_node_atr = torch.bmm(permutation_matrices, self.node_atr_matrices)
 
+        # edge attr
         # the edge attribute one is easier to deal with if we first switch the dimensions
         temp_edge_attr = self.edge_atr_tensors.permute(0,3,1,2).contiguous().view(-1, num_nodes, num_nodes)
         new_edge_attr = torch.bmm(permutation_matrices.repeat_interleave(CHEM_DETAILS.num_bond_types, dim=0),temp_edge_attr)

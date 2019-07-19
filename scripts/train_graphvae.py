@@ -1,3 +1,13 @@
+"""Train GraphVAE
+
+Usage:
+  train_graphvae.py <dataset_name> [--mpm]
+
+
+Options:
+    --mpm   run the MPM graph matching routine.
+"""
+from docopt import docopt
 
 import datetime
 from contextlib import contextmanager
@@ -19,13 +29,19 @@ import graph_vae as gv
 
 class Params:
     def __init__(self):
-        self.run_graph_matching = False
-        self.rng = np.random.RandomState(42)
+        arguments = docopt(__doc__)
+        self.dataset_name = arguments['<dataset_name>']
+
+        self.rng = np.random.RandomState(3743)
+        torch.manual_seed(self.rng.choice(10000))
 
         # Model Details
+        self.run_graph_matching = arguments['--mpm']
         self.latent_space_dim = 40
         self.max_num_nodes = 9
         self.beta = 1. / 40.
+        # in their paper they had beta=1. (apart from appendix). However, I'm not too sure whether they were also
+        # averaging KL as this was done eg in the GrammarVAE paper. Hence here set to that effect.
 
         # Training details
         self.num_epochs = 25
@@ -33,9 +49,14 @@ class Params:
         self.adam_lr = 1e-3
         self.adam_beta1 = 0.5
 
+        print(f"Dataset name is {self.dataset_name} and we are running graph matching is {self.run_graph_matching}")
+
     def save_weights_name(self, time_of_run):
         mid_ = "_with_graph_matching" if self.run_graph_matching else ""
-        return "graph_vae_weights" + mid_ + time_of_run + ".pth.pick"
+        return "weights/gvae" + mid_ + time_of_run + f"_{self.dataset_name}.pth.pick"
+
+    def get_params_to_save(self):
+        return {k:v for k, v in self.__dict__.items() if isinstance(v, (int, float, str, bool))}
 
 
 class TbLoggerWrapper:
@@ -134,7 +155,7 @@ def sample_graphs_from_prior(vae, tb_logger, latent_space_dim, torch_device):
 
 
 @torch.no_grad()
-def check_reconstuctions(vae, tb_logger, smiles, torch_device, max_num_nodes):
+def check_reconstructions(vae, tb_logger, smiles, torch_device, max_num_nodes):
     """
     this function samples ten graphs from prior and plots them in Tensorboard as the training progresses.
     """
@@ -168,14 +189,11 @@ def main(params: Params):
     val_log_helper = ae.LogHelper([val_writer.epoch_counting_add_values])
 
     # Get Dataset and break down into train and validation datasets
-    dataset = gv.SmilesDataset("../qm9_smiles.txt")
-    permutation = params.rng.permutation(len(dataset))
-    train_dataset, valid_dataset, test_dataset = dataset.split_dataset(permutation[:-20000], permutation[-20000:-18000],
-                                                                       permutation[-10000:])
+    train_dataset, valid_dataset, test_dataset = gv.get_dataset(params.dataset_name)
 
     # Get Dataloaders
-    num_workers = 0  # we are going to convert from SMILES to graphs on the fly hence useful if we do this over several
-    # processes.
+    num_workers = 3
+    # ^ we are going to convert from SMILES to graphs on the fly hence useful if we do this over several processes.
     collate_func = lambda list_of_smiles: gv.OneHotMolecularGraphs.create_from_smiles_list(list_of_smiles,
                                                                                            params.max_num_nodes)
     train_dataloader = data.DataLoader(train_dataset, batch_size=params.batch_size, shuffle=True, num_workers=num_workers,
@@ -216,11 +234,13 @@ def main(params: Params):
         with validation_mode():
             vae_val(vae, valid_dataloader, cuda_details.device_str)
         sample_graphs_from_prior(vae, val_writer, params.latent_space_dim, cuda_details.device_str)
-        check_reconstuctions(vae, val_writer, valid_dataset.data[:30], cuda_details.device_str, params.max_num_nodes)
+        check_reconstructions(vae, val_writer, valid_dataset.data[:30], cuda_details.device_str, params.max_num_nodes)
 
+    # Save weights and closer.
     torch.save({
         "vae": vae.state_dict(),
         "optimizer": optimizer.state_dict(),
+        'params': params.get_params_to_save()
     }, params.save_weights_name(time_of_run))
     train_writer.close()
     val_writer.close()

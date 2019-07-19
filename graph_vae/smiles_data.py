@@ -35,3 +35,16 @@ class SmilesDataset(data.Dataset):
 
         return new_ds_train, new_ds_valid, new_ds_test
 
+
+def get_dataset(name):
+    rng = np.random.RandomState(7244)
+    if name == "qm9":
+        dataset = SmilesDataset("../qm9_smiles.txt")
+        permutation = rng.permutation(len(dataset))
+        permutation_parts = [permutation[:-20000].tolist(), permutation[-20000:-15000].tolist(),
+                             permutation[-10000:].tolist()]
+        train_dataset, valid_dataset, test_dataset = dataset.split_dataset(*permutation_parts)
+    else:
+        raise NotImplementedError
+    return train_dataset, valid_dataset, test_dataset
+

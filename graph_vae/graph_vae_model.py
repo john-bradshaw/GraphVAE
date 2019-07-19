@@ -115,6 +115,8 @@ class Decoder(base_parameterised_distribution.BaseParameterisedDistribution):
         return nll
 
     def update(self, latent_z: torch.Tensor):
+        # We run NN forward to get a vector for each graph. We then unpack this vector to assemble the different
+        # Matrices and Tensors we need.
         graph_logits_packed = self.parameterizing_net(latent_z)
         self._tilde_structure = graph_datastructure.LogitMolecularGraphs.create_from_nn_prediction(graph_logits_packed,
                                                                                                    self.max_num_nodes)
