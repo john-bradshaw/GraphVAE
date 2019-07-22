@@ -25,10 +25,20 @@ to put you in a bash shell inside the container).
  
 ## Scripts
 ### Training
-* `scripts/train_graphvae.py` for training the VAE. Will produce weights at end and Tensorboard log files as we train.
+Run `scripts/train_graphvae.py` for training the VAE. Will produce weights at end and Tensorboard log files as we train.
+
+![QM9 Training losses](misc/qm9_losses.png "QM9 Training losses")
+
+_Fig1: Training losses for QM9 Dataset_
+
+
 
 ### Sampling
-coming soon!
+Run `scripts/sample_graphvae.py` for sampling from the prior of a trained VAE.
+
+![25 QM9 sampled molecules from trained VAE prior (VAE trained with graph matching)](misc/samples_new_svg.svg "QM9 Samples from trained VAE prior")
+
+_Fig2: QM9 Samples from trained VAE prior (VAE trained with graph matching)_
 
  
 ## Notation in comments
