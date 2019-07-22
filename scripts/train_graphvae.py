@@ -1,11 +1,12 @@
 """Train GraphVAE
 
 Usage:
-  train_graphvae.py <dataset_name> [--mpm]
+  train_graphvae.py <dataset_name> [--mpm] [--max_num_nodes=<num>]
 
 
 Options:
     --mpm   run the MPM graph matching routine.
+    --max_num_nodes=<num>  Maximum number of nodes [default: 9].
 """
 from docopt import docopt
 
@@ -38,7 +39,7 @@ class Params:
         # Model Details
         self.run_graph_matching = arguments['--mpm']
         self.latent_space_dim = 40
-        self.max_num_nodes = 9
+        self.max_num_nodes = int(arguments['--max_num_nodes'])
         self.beta = 1. / 40.
         # in their paper they had beta=1. (apart from appendix). However, I'm not too sure whether they were also
         # averaging KL as this was done eg in the GrammarVAE paper. Hence here set to that effect.
@@ -50,6 +51,7 @@ class Params:
         self.adam_beta1 = 0.5
 
         print(f"Dataset name is {self.dataset_name} and we are running graph matching is {self.run_graph_matching}")
+        print(f"Max num nodes is {self.max_num_nodes}")
 
     def save_weights_name(self, time_of_run):
         mid_ = "_with_graph_matching" if self.run_graph_matching else ""
