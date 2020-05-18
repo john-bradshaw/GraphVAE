@@ -12,9 +12,15 @@ from rdkit import Chem
 
 class ChemicalDetails:
     def __init__(self):
-        self.atom_types =  ['C', 'N', 'O', 'S', 'Se', 'Si', 'I', 'F', 'Cl', 'Br']
+        self.atom_types = ['C', 'N', 'O', 'S', 'Se', 'Si', 'I', 'F', 'Cl', 'Br']
         self.bond_types = [Chem.BondType.SINGLE, Chem.BondType.DOUBLE, Chem.BondType.TRIPLE, Chem.BondType.AROMATIC]
+        self.ele_to_idx = None
+        self.idx_to_ele = None
+        self.edge_to_idx = None
+        self.idx_to_edge = None
+        self.setup()
 
+    def setup(self):
         self.ele_to_idx = {k:v for v,k  in enumerate(self.atom_types)}
         self.idx_to_ele = {v:k for k,v in self.ele_to_idx.items()}
         self.edge_to_idx = {k:v for v,k  in enumerate(self.bond_types)}
@@ -27,6 +33,21 @@ class ChemicalDetails:
     @property
     def num_node_types(self):
         return len(self.atom_types)
+
+    def set_atom_types(self, new_atom_types):
+        self.atom_types = new_atom_types
+        print(f"New atom types are {self.atom_types}")
+        self.setup()
+
+    def set_for_dataset(self, dataset: str):
+        if dataset == "zinc":
+            self.set_atom_types(['Br', 'C', 'Cl', 'F', 'I', 'N', 'O', 'P', 'S'])
+        elif dataset == "zinc-20":
+            self.set_atom_types(['Br', 'C', 'Cl', 'F', 'I', 'N', 'O', 'P', 'S'])
+        elif dataset == "qm9":
+            self.set_atom_types(['C', 'N', 'O', 'S', 'Se', 'Si', 'I', 'F', 'Cl', 'Br'])
+        else:
+            raise NotImplementedError
 
 
 CHEM_DETAILS = ChemicalDetails()

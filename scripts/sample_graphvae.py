@@ -1,7 +1,7 @@
 """Train GraphVAE
 
 Usage:
-  train_graphvae.py <weights_name> [--num_samples=<num>]
+  sample_graphvae.py <weights_name> [--num_samples=<num>]
 
 
 Options:
@@ -36,11 +36,19 @@ def main():
     # Load the weights
     saved_state = torch.load(weights_name, map_location=cuda_details.device_str)
 
+    # Set datastuctures
+    dataset_name = saved_state['params']['dataset_name']
+    print(f"Dataset name: {dataset_name}")
+    gv.CHEM_DETAILS.set_for_dataset(saved_state['params']['dataset_name'])
+
     # Create the network
     print(f"Weights came with the following params: {saved_state['params']}")
+    num_ggnn_steps = 3 if dataset_name in {'zinc', "zinc-20"} else 2
+    ggnn_hidden_size = 256 if dataset_name in {'zinc', "zinc-20"} else 64
     vae = gv.make_gvae(saved_state['params']['latent_space_dim'],
                        saved_state['params']['max_num_nodes'], cuda_details,
-                       run_graph_matching_flag=saved_state['params']['run_graph_matching'])
+                       run_graph_matching_flag=saved_state['params']['run_graph_matching'], T=num_ggnn_steps,
+                       graph_hidden_layer_size=ggnn_hidden_size)
     vae = cuda_details.return_cudafied(vae)
     vae.load_state_dict(saved_state['vae'])
 
@@ -52,7 +60,7 @@ def main():
         z_sample = torch.randn(sample_batch_size, saved_state['params']['latent_space_dim']).to(cuda_details.device_str)
         vae.decoder.update(z_sample)
         m: gv.OneHotMolecularGraphs = vae.decoder.mode()
-        smi_strs = m.to_smiles_strings()
+        smi_strs = m.to_smiles_strings(add_implicit_hydrogen=False)
         sampled_smiles += smi_strs
 
     # Now write out!

@@ -13,14 +13,14 @@ GraphRNN: Generating Realistic Graphs with Deep Auto-regressive Model (ICML 2018
  
 
 ## Installation
-* We are using Python 3.6, PyTorch 1.1.
+* We are using Python 3.6, PyTorch 1.1. Easiest to install on a GPU machine using the `conda_environment.yml` file.
 * Note the submodules when cloning this repo, ie do `git submodule init` and `git submodule update` after cloning.
 * We have a bash script that can setup the Python Path correctly. 
 If you want to use this you can do so by eg `source set_up.sh`.
 * We're using pytest for the tests.
 * We have a dockerfile (which also lists the requirements). To use build it, eg  `docker build -t johnbradshaw/graph-vae .`
 and then to run it eg ` docker run -it johnbradshaw/graph-vae:latest` (or ` docker run -it johnbradshaw/graph-vae:latest  bash` 
-to put you in a bash shell inside the container).
+to put you in a bash shell inside the container). This currently does not take advantage of the GPU.
  
  
 ## Scripts
@@ -52,3 +52,13 @@ Tried to use the following notation consistently when adding comments to the cod
 `h` the dimension of the node representation      
 `[...]` corresponding array/tensor shape. eg `[2,4]` signifies a 2 by 4 matrix
 `g` the number of groups
+
+
+## Data Sources
+* QM9, `qm9_smiles.txt`. Taken from `https://ndownloader.figshare.com/files/3195389`, following
+ https://github.com/microsoft/constrained-graph-variational-autoencoder/blob/master/data/get_qm9.py
+* Zinc, `250k_rndm_zinc_drugs_clean.txt`: Taken from https://github.com/mkusner/grammarVAE
+This contains the elements: `{'Br', 'C', 'Cl', 'F', 'I', 'N', 'O', 'P', 'S'}` in molecules containing 6-38 atoms (we
+don't count Hydrogen). 249456 items.
+
+

@@ -53,9 +53,10 @@ class Params:
         print(f"Dataset name is {self.dataset_name} and we are running graph matching is {self.run_graph_matching}")
         print(f"Max num nodes is {self.max_num_nodes}")
 
-    def save_weights_name(self, time_of_run):
+    def save_weights_name(self, time_of_run, epoch_num=None):
         mid_ = "_with_graph_matching" if self.run_graph_matching else ""
-        return "weights/gvae" + mid_ + time_of_run + f"_{self.dataset_name}.pth.pick"
+        epoch_str = "" if epoch_num is None else f"_epoch{epoch_num}"
+        return "weights/gvae" + mid_ + epoch_str + time_of_run + f"_{self.dataset_name}.pth.pick"
 
     def get_params_to_save(self):
         return {k:v for k, v in self.__dict__.items() if isinstance(v, (int, float, str, bool))}
@@ -138,22 +139,37 @@ def vae_val(vae,  dataloader, torch_device):
 @torch.no_grad()
 def sample_graphs_from_prior(vae, tb_logger, latent_space_dim, torch_device):
     """
-    this function samples ten graphs from prior and plots them in Tensorboard as the training progresses.
+    this function samples num_samples graphs from prior and plots them in Tensorboard as the training progresses.
     """
     from rdkit.Chem import Draw
+    from rdkit import Chem
 
     # Sample a batch of new graphs at once.
-    z_sample = torch.randn(30, latent_space_dim).to(torch_device)
+    num_samples = 100
+    num_to_draw = 30
+    z_sample = torch.randn(num_samples, latent_space_dim).to(torch_device)
     vae.decoder.update(z_sample)
     m: gv.OneHotMolecularGraphs = vae.decoder.mode()
 
     mols = m.to_molecules()
-    for i, mol in enumerate(mols):
+    for i, mol in enumerate(mols[:num_to_draw]):
         try:
             img_canvas = np.array(Draw.MolToImage(mol, size=(400, 400), fitImage=True))
         except:
             img_canvas = np.zeros((400, 400, 3))
         tb_logger.add_image(f"sample_{i}", img_canvas, dataformats='HWC')
+
+    success = 0
+    for mol in mols:
+        try:
+            smi = Chem.MolToSmiles(Chem.MolFromSmiles(Chem.MolToSmiles(mol)))
+            # ^nb can write it out the first time but not the second.
+            success += 1
+        except Exception:
+            pass
+    print(f"Sampled {num_samples} graphs from prior, of these {success} were able to"
+          f" be written to SMILES (proportion of {success/num_samples:.3f})")
+
 
 
 @torch.no_grad()
@@ -193,6 +209,9 @@ def main(params: Params):
     # Get Dataset and break down into train and validation datasets
     train_dataset, valid_dataset, test_dataset = gv.get_dataset(params.dataset_name)
 
+    # Set details about atoms and elements
+    gv.CHEM_DETAILS.set_for_dataset(params.dataset_name)
+
     # Get Dataloaders
     num_workers = 3
     # ^ we are going to convert from SMILES to graphs on the fly hence useful if we do this over several processes.
@@ -205,7 +224,10 @@ def main(params: Params):
 
     # Create model and optimizer
     cuda_details = utils.CudaDetails(use_cuda=torch.cuda.is_available())
-    vae = gv.make_gvae(params.latent_space_dim, params.max_num_nodes, cuda_details, run_graph_matching_flag=params.run_graph_matching)
+    num_ggnn_layers = 3 if params.dataset_name in {'zinc', "zinc-20"} else 2
+    ggnn_hidden_size = 256 if params.dataset_name in {'zinc', "zinc-20"} else 64
+    vae = gv.make_gvae(params.latent_space_dim, params.max_num_nodes, cuda_details,
+                       run_graph_matching_flag=params.run_graph_matching, T=num_ggnn_layers, graph_hidden_layer_size=ggnn_hidden_size)
     vae = cuda_details.return_cudafied(vae)
     optimizer = optim.Adam(vae.parameters(), lr=params.adam_lr, betas=(params.adam_beta1, 0.999))
 
@@ -237,6 +259,12 @@ def main(params: Params):
             vae_val(vae, valid_dataloader, cuda_details.device_str)
         sample_graphs_from_prior(vae, val_writer, params.latent_space_dim, cuda_details.device_str)
         check_reconstructions(vae, val_writer, valid_dataset.data[:30], cuda_details.device_str, params.max_num_nodes)
+
+        torch.save({
+            "vae": vae.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            'params': params.get_params_to_save()
+        }, params.save_weights_name(time_of_run, epoch_num))
 
     # Save weights and closer.
     torch.save({

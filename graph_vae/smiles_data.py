@@ -44,7 +44,18 @@ def get_dataset(name):
         permutation_parts = [permutation[:-20000].tolist(), permutation[-20000:-15000].tolist(),
                              permutation[-10000:].tolist()]
         train_dataset, valid_dataset, test_dataset = dataset.split_dataset(*permutation_parts)
+    elif name == "zinc":
+        dataset = SmilesDataset("../250k_rndm_zinc_drugs_clean.txt")
+        permutation = rng.permutation(len(dataset))
+        permutation_parts = [permutation[:-20000].tolist(), permutation[-20000:-15000].tolist(),
+                             permutation[-10000:].tolist()]
+        train_dataset, valid_dataset, test_dataset = dataset.split_dataset(*permutation_parts)
+    elif name == "zinc-20":
+        dataset = SmilesDataset("../zinc_leq20nodes.txt")
+        permutation = rng.permutation(len(dataset))
+        permutation_parts = [permutation[:-20000].tolist(), permutation[-20000:-15000].tolist(),
+                             permutation[-10000:].tolist()]
+        train_dataset, valid_dataset, test_dataset = dataset.split_dataset(*permutation_parts)
     else:
         raise NotImplementedError
     return train_dataset, valid_dataset, test_dataset
-

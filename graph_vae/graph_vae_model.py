@@ -122,9 +122,11 @@ class Decoder(base_parameterised_distribution.BaseParameterisedDistribution):
                                                                                                    self.max_num_nodes)
 
 
-def make_gvae(latent_space_dim: int, max_num_nodes, cuda_details: utils.CudaDetails, run_graph_matching_flag: bool):
+def make_gvae(latent_space_dim: int, max_num_nodes, cuda_details: utils.CudaDetails, run_graph_matching_flag: bool, T: int=2,
+              graph_hidden_layer_size: int=64):
+
     # Encoder
-    encoder = nn_paramterised_dists.NNParamterisedDistribution(EncoderNet(64, cuda_details, T=2, out_dim=2 * latent_space_dim),
+    encoder = nn_paramterised_dists.NNParamterisedDistribution(EncoderNet(graph_hidden_layer_size, cuda_details, T=T, out_dim=2 * latent_space_dim),
                                                     shallow_distributions.IndependentGaussianDistribution())
 
     # Decoder
