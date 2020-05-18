@@ -151,6 +151,7 @@ def sample_graphs_from_prior(vae, tb_logger, latent_space_dim, torch_device):
     vae.decoder.update(z_sample)
     m: gv.OneHotMolecularGraphs = vae.decoder.mode()
 
+    # We will draw out the molecules into Tensorboard's image section.
     mols = m.to_molecules()
     for i, mol in enumerate(mols[:num_to_draw]):
         try:
@@ -159,6 +160,7 @@ def sample_graphs_from_prior(vae, tb_logger, latent_space_dim, torch_device):
             img_canvas = np.zeros((400, 400, 3))
         tb_logger.add_image(f"sample_{i}", img_canvas, dataformats='HWC')
 
+    # We'll measure and print out how many of these can be parsed by RDKIT
     success = 0
     for mol in mols:
         try:
@@ -174,9 +176,6 @@ def sample_graphs_from_prior(vae, tb_logger, latent_space_dim, torch_device):
 
 @torch.no_grad()
 def check_reconstructions(vae, tb_logger, smiles, torch_device, max_num_nodes):
-    """
-    this function samples ten graphs from prior and plots them in Tensorboard as the training progresses.
-    """
     from rdkit.Chem import Draw
     from rdkit import Chem
 
